@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}HK Wind Sketch{% endblock %}</title>
+  <style>
+    :root{--mcb-cream:244 241 235;--mcb-paper:250 248 245;--mcb-ink:26 26 26;--mcb-line:228 223 211;--mcb-muted:105 102 96;--mcb-accent:196 98 64}
+    @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--mcb-cream:30 30 28;--mcb-paper:38 38 36;--mcb-ink:240 238 232;--mcb-line:64 63 60;--mcb-muted:160 157 150;--mcb-accent:222 136 104}}
+    :root[data-theme="dark"]{--mcb-cream:30 30 28;--mcb-paper:38 38 36;--mcb-ink:240 238 232;--mcb-line:64 63 60;--mcb-muted:160 157 150;--mcb-accent:222 136 104}
+    *{box-sizing:border-box}
+    body{margin:0;background:rgb(var(--mcb-cream));color:rgb(var(--mcb-ink));font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,"Microsoft JhengHei",sans-serif}
+    main{padding:20px 16px 40px}
+    a{color:rgb(var(--mcb-accent))}
+  </style>
+</head>
+<body>
+  <main class="{% block main_class %}{% endblock %}">{% block content %}{% endblock %}</main>
+</body>
+</html>

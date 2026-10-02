@@ -1,0 +1,9 @@
+{% extends base_template %}
+{% block title %}HK Wind Sketch · 香港風環境草圖{% endblock %}
+{% block main_class %}px-4 md:px-8 py-6 md:py-8{% endblock %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('wind.static', filename='wind.css') }}">
+{% include "wind/_body.html" %}
+<script>window.HKW_DATA_URL = "{{ url_for('wind.static', filename='data/') }}";</script>
+<script src="{{ url_for('wind.static', filename='wind.js') }}"></script>
+{% endblock %}

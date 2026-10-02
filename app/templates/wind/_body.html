@@ -1,0 +1,130 @@
+<div class="hkw" id="hkw">
+
+  <header class="hkw-head">
+    <div class="hkw-kicker">HK Wind Sketch · 香港風環境草圖</div>
+    <h1>See how wind moves between buildings at street level</h1>
+    <p class="hkw-lede">Pick an area of Hong Kong and a wind direction. Your browser runs a small wind simulation on a flat slice about 2 m above the ground, through the government's building footprints. Draw a new block and watch the street wind change.</p>
+    <p class="hkw-lede">揀一個地區同風向，你部電腦會即時計一個離地大約 2 米嘅風場切面。加一座新樓，睇下條街嘅風點變。</p>
+    <p class="hkw-warn">A qualitative 2D sketch for teaching and early design feel. Not an Air Ventilation Assessment (AVA) under HPLB/ETWB TC No. 1/06: no wind velocity ratio (VR) figures, no pass or fail. 只係教學同早期設計參考嘅二維草圖，唔係 AVA，冇 VR 數字，冇合格不合格。</p>
+  </header>
+
+  <div class="hkw-areas" role="group" aria-label="Area">
+    <span class="hkw-step">1 · Area 地區</span>
+    <button type="button" class="hkw-chip" data-area="kwun_tong">Kwun Tong 觀塘</button>
+    <button type="button" class="hkw-chip" data-area="central">Central 中環</button>
+    <button type="button" class="hkw-chip" data-area="mong_kok">Mong Kok 旺角</button>
+    <button type="button" class="hkw-chip" data-area="tsuen_wan">Tsuen Wan 荃灣</button>
+  </div>
+  <p class="hkw-areanote" id="hkwAreaNote"></p>
+
+  <div class="hkw-main">
+    <div class="hkw-stagewrap">
+      <div class="hkw-stage" id="hkwStage">
+        <canvas id="hkwField" class="hkw-field"></canvas>
+        <canvas id="hkwTrail"></canvas>
+        <canvas id="hkwBld"></canvas>
+        <div class="hkw-north" aria-hidden="true"><span>N</span>&#9650;</div>
+        <div class="hkw-scale" aria-hidden="true"><i></i><span>100 m</span></div>
+        <div class="hkw-tip" id="hkwTip" hidden></div>
+      </div>
+      <div class="hkw-legend">
+        <div class="hkw-legendbar" id="hkwLegendBar"></div>
+        <div class="hkw-legendlbl"><span>Calm 靜</span><span>Same as the incoming wind 同來風差唔多</span><span>Faster 加速</span></div>
+        <div class="small">Speed compared with the wind coming in at the edge. Qualitative colours only, no numbers. Grey blocks: darker = taller. Dashed outline: does not block the 2 m slice.</div>
+      </div>
+      <div class="hkw-bar">
+        <button type="button" class="hkw-btn" id="hkwRun">Pause 暫停</button>
+        <button type="button" class="hkw-btn" id="hkwReset">Restart flow 重新開始</button>
+        <span class="hkw-settle" id="hkwSettle">Settling 形成中</span>
+        <span class="small" id="hkwStatus"></span>
+      </div>
+      <p class="hkw-pausenote" id="hkwPauseNote" hidden>Paused to rest your computer after 90 seconds with no input. Press Run to carry on. 冇人用 90 秒，自動暫停咗。</p>
+      <p class="small" id="hkwEngine"></p>
+    </div>
+
+    <aside class="hkw-side">
+      <section class="hkw-card">
+        <div class="hkw-step">2 · Wind direction 風向</div>
+        <div class="hkw-seasons">
+          <button type="button" class="hkw-chip sm" data-season="annual">全年 Annual</button>
+          <button type="button" class="hkw-chip sm" data-season="summer">夏季 Summer</button>
+          <button type="button" class="hkw-chip sm" data-season="winter">冬季 Winter</button>
+        </div>
+        <svg id="hkwRose" class="hkw-rose" viewBox="0 0 220 220" role="img" aria-label="Wind direction picker"></svg>
+        <p class="hkw-windtext" id="hkwWindText"></p>
+        <p class="small" id="hkwTops"></p>
+        <p class="small">Petal length = how often the wind comes from that direction here, from PlanD's Site Wind Availability Data. Click a petal to pick it. The simulated wind has the same strength for every direction.</p>
+      </section>
+
+      <section class="hkw-card">
+        <div class="hkw-step">3 · Try a design 試吓設計</div>
+        <div class="hkw-modes" role="group">
+          <button type="button" class="hkw-chip" data-mode="look">Look 睇</button>
+          <button type="button" class="hkw-chip" data-mode="add">Add block 加樓</button>
+          <button type="button" class="hkw-chip" data-mode="remove">Remove 拆走</button>
+        </div>
+        <p class="small" id="hkwModeHelp"></p>
+        <label class="hkw-f">Height of new blocks 新樓高度 (m) <input type="number" id="hkwNewH" value="60" min="3" max="500" step="1"></label>
+        <div class="hkw-sel" id="hkwSel" hidden>
+          <div class="hkw-step">Selected block 揀咗嘅樓</div>
+          <div class="hkw-grid">
+            <label class="hkw-f">Width 闊 (m)<input type="number" id="hkwSelW" min="6" max="300" step="1"></label>
+            <label class="hkw-f">Depth 深 (m)<input type="number" id="hkwSelD" min="6" max="300" step="1"></label>
+            <label class="hkw-f">Height 高 (m)<input type="number" id="hkwSelH" min="3" max="500" step="1"></label>
+          </div>
+          <label class="hkw-f">Rotate 轉 <span id="hkwSelRv">0°</span><input type="range" id="hkwSelR" min="-90" max="90" step="1" value="0"></label>
+          <button type="button" class="hkw-btn" id="hkwSelDel">Delete block 刪除</button>
+        </div>
+        <button type="button" class="hkw-btn" id="hkwUndo">Undo all edits 還原</button>
+      </section>
+
+      <section class="hkw-card">
+        <div class="hkw-step">Display 顯示</div>
+        <label class="hkw-check"><input type="checkbox" id="hkwShowField" checked> Colour by wind speed 風速顏色</label>
+        <label class="hkw-check"><input type="checkbox" id="hkwShowParticles" checked> Moving streaks 氣流線</label>
+        <label class="hkw-f">Detail 精細度
+          <select id="hkwQuality">
+            <option value="light">Light: 240 x 240 cells (2.5 m)</option>
+            <option value="normal">Normal: 300 x 300 cells (2 m)</option>
+            <option value="fine">Fine: 400 x 400 cells (1.5 m)</option>
+          </select>
+        </label>
+      </section>
+    </aside>
+  </div>
+
+  <section class="hkw-explain">
+    <div>
+      <h3>How to read it 點樣睇</h3>
+      <ul>
+        <li><b>Wind corridors 風道:</b> long yellow or orange bands along streets that line up with the wind.</li>
+        <li><b>Calm zones 靜風區:</b> dark blue patches behind blocks (the wake) and inside courtyards.</li>
+        <li><b>Corner acceleration 轉角加速:</b> orange or red spots where the wind squeezes round a corner.</li>
+        <li>White streaks follow the air. Eddies keep moving after the pattern settles; real wind is unsteady too.</li>
+        <li>Compare, don't measure: change one thing (a block, a gap, a direction) and look at what changes.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>What height does here 高度有咩用</h3>
+      <p>The simulation is one flat slice about 2 m above the ground. A block either stands in that slice or it doesn't, so height decides only one thing: a block at least 2.5 m tall from its own base blocks the slice. A 10-storey and a 60-storey tower look the same to this sketch.</p>
+      <p>In real streets tall towers also drag faster air down to the pavement (downwash), and wind comes over roofs as well as round the sides. A 2D slice shows neither. 二維切面睇唔到高樓將高空風帶落地面，亦睇唔到風由屋頂吹過。</p>
+    </div>
+    <div>
+      <h3>What this is not 呢個唔係乜</h3>
+      <ul>
+        <li>Not an AVA and not the TC No. 1/06 method, which needs 3D, wind directions weighted by how often they blow, VR at test points, and usually a wind tunnel for a Detailed Study.</li>
+        <li>No wind speeds, no VR, no comfort or safety rating, no pass or fail.</li>
+        <li>Nothing about wind loads on buildings (that is the Code of Practice on Wind Effects in Hong Kong 2019, for structural engineers).</li>
+        <li>2D only: no terrain, trees, footbridges or covered walkways; open ground floors are not known; cells are about 2 m; the incoming wind is uniform and made up.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>How it works 原理</h3>
+      <p>The 600 m square is split into a grid of cells (300 x 300 at Normal). Each cell holds nine numbers: how much air is moving in each of nine directions. Every step the air hops to the next cell and the nine numbers relax towards a balanced mix; air that hits a wall bounces back. This is the lattice Boltzmann method (D2Q9, with a Smagorinsky turbulence model). Thousands of steps later, the street pattern appears. It runs on your own computer: nothing is uploaded.</p>
+    </div>
+  </section>
+
+  <footer class="hkw-credits">
+    <b>Data 數據來源.</b> Building footprints and heights: Lands Department, HKSAR Government, Building dataset (CSDI Portal / DATA.GOV.HK). Wind direction frequencies: Planning Department, HKSAR Government, Site Wind Availability Data (simulated, 500 m grid, 200 m level). Used under the DATA.GOV.HK Terms and Conditions; the data is provided as is, with no warranty from the Government. Footprints fetched October 2026 and may not show recent changes. Simulation code: HK Wind Sketch, open source (MIT). Not official. Not professional advice.
+  </footer>
+</div>
