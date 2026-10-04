@@ -105,3 +105,9 @@
 .hkw-loading[hidden]{display:none}
 .hkw-loading .hkw-btn{color:#fff;border-color:#fff;margin-top:10px}
 .hkw-tip{z-index:5}
+/* v3 */
+.hkw-check[hidden],.hkw-f[hidden]{display:none}
+.hkw-snaps{display:flex;flex-wrap:wrap;gap:4px 14px;margin:2px 0 6px}
+.hkw-check.sm{font-size:12px;margin:2px 0}
+.hkw-drawmsg{color:rgb(var(--mcb-accent));min-height:1em;margin:4px 0}
+.hkw-f input[type=range]{width:100%}

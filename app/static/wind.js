@@ -1,9 +1,11 @@
-/* HK Wind Sketch: a qualitative 2D wind sketch at pedestrian level for Hong Kong.
+/* HK Wind Sketch v3: a qualitative wind sketch for Hong Kong, in 3D.
  *
- * A D2Q9 lattice Boltzmann solver (BGK + Smagorinsky) on a square slice about
- * 2 m above ground, through LandsD building footprints. WebGL2 (float render
- * targets) when available, plain JavaScript otherwise. Everything runs in the
- * browser: no server, no upload.
+ * Main engine: a 3D lattice Boltzmann solver (D3Q19, regularised BGK +
+ * Smagorinsky, see solver3d.js) on the graphics card, over a 600 m square of
+ * real terrain (LandsD digital terrain model) and LandsD buildings, with a
+ * power-law wind profile coming in from the chosen direction. Fallback: the v2
+ * 2D slice about 2 m above the ground (D2Q9, WebGL2 or plain JavaScript).
+ * Everything runs in the browser: no server, no upload.
  *
  * Not an Air Ventilation Assessment (HPLB/ETWB TC No. 1/06). No VR numbers.
  * Open source, MIT licence. Data: Lands Department and Planning Department,
@@ -27,6 +29,15 @@
   const IDLE_PAUSE_MS = 90000;     // pause when nobody has touched the page for this long
   const QUALITY = { light: 240, normal: 300, fine: 400 };
   const CPU_N = 150;
+  // 3D engine: cells across the square, and a cap on the total cell count per quality
+  const Q3 = { light: 96, normal: 128, fine: 160 };
+  const BUDGET3 = { light: 0.6e6, normal: 1.15e6, fine: 1.75e6 };
+  const UREF = 0.1;                // lattice speed of the incoming wind at the reference height
+  const ZREF_M = 200;              // reference height = PlanD's 200 m level
+  const ALPHA = 0.25;              // power-law profile exponent (assumed, built-up terrain upwind)
+  const NU3 = 0.005, CS3 = 0.17;   // lattice viscosity and Smagorinsky constant in 3D
+  const READ_MS = 220;             // how often the 3D field is copied back for drawing
+  const BATCH_MS = 18;             // GPU time per frame the 3D solver may use (of about 33 ms)
   const DIRS = [
     ['N', '北'], ['NNE', '北北東'], ['NE', '東北'], ['ENE', '東北東'],
     ['E', '東'], ['ESE', '東南東'], ['SE', '東南'], ['SSE', '南南東'],
@@ -294,9 +305,9 @@ void main(){
   }
 
   // ---------------------------------------------------------------- colour map
-  const STOPS = [   // speed relative to incoming wind -> colour
-    [0.00, [24, 44, 84]], [0.35, [38, 104, 160]], [0.70, [62, 165, 150]],
-    [1.00, [228, 198, 78]], [1.30, [236, 122, 44]], [1.70, [176, 36, 30]],
+  const STOPS = [   // speed relative to the incoming wind at the same height -> colour (blues: pale = calm, deep = fast)
+    [0.00, [246, 249, 252]], [0.30, [205, 224, 241]], [0.60, [140, 187, 223]],
+    [0.90, [70, 140, 199]], [1.15, [28, 92, 168]], [1.40, [12, 50, 122]], [1.70, [52, 24, 96]],
   ];
   const LUT_MAX = 1.7, LUT = new Uint8ClampedArray(256 * 3);
   for (let k = 0; k < 256; k++) {
@@ -317,46 +328,98 @@ void main(){
   const statusEl = $('#hkwStatus'), engineEl = $('#hkwEngine'), settleEl = $('#hkwSettle');
   const runBtn = $('#hkwRun'), pauseNote = $('#hkwPauseNote');
 
+  const isPhone = () => (window.matchMedia && matchMedia('(pointer: coarse)').matches) && Math.min(screen.width, screen.height) < 700;
   const S = {
     data: null, areaId: params.get('lat') ? null : (params.get('area') || 'kwun_tong'), dirIdx: null, season: 'annual',
     view: '2d', loading: false, siteLabel: '',
-    quality: params.get('quality') || 'normal', running: true, idlePaused: false,
-    showField: true, showParticles: true, mode: 'look', user: [], removed: new Set(), sel: null,
+    quality: params.get('quality') || (isPhone() ? 'light' : 'normal'), running: true, idlePaused: false,
+    // engine: '3d' (3D lattice Boltzmann) or '2d' (v2 slice). Phones start on the lighter 2D slice.
+    engine: ['2d', 'cpu'].includes(params.get('engine')) ? '2d' : (params.get('engine') === '3d' || !isPhone() ? '3d' : '2d'),
+    showField: true, showParticles: true, showLines: true, showSection: false, sectionOff: 0,
+    mode: 'look', user: [], removed: new Set(), sel: null, selV: null,
     steps: 0, lastTouch: performance.now(), spf: 20, size: 600, dpr: 1, field: null, fps: 0,
+    terrain: null, engineNote: '',
   };
   let solver = null, maskArr = null, particles = [], buildings = [], nextUserId = 1;
-  let view3d = null, view3dLoading = null, need3d = { site: true, user: true };
-  window.HKW = { state: S, get solver() { return solver; }, get view3d() { return view3d; }, HK80 };   // for tests and the curious
+  let view3d = null, view3dLoading = null, need3d = { site: true, user: true, terrain: true };
+  // 3D engine state
+  let s3 = null, s3Key = '', s3Failed = false, g3 = null, field3 = null, field3At = 0, readBusy = false, flowToken = 0;
+  let parts3 = [], lines3At = 0, s3Creating = null;
+  const slice = { buf: null };
+  window.HKW = { state: S, get solver() { return solver; }, get view3d() { return view3d; }, get s3() { return s3; }, get g3() { return g3; }, get field3() { return field3; }, HK80 };
 
   function forceCPU() { return params.get('engine') === 'cpu'; }
+  function engineText() {
+    if (solver && solver.kind === '3d') {
+      const g = g3;
+      return `3D wind on the graphics card (${s3.label}) · ${g.nx} x ${g.ny} x ${g.nz} cells, ${g.dx.toFixed(1)} m each, up to ${Math.round(g.nz * g.dx)} m above the lowest ground` +
+        (g.coarsened ? '. Steep or tall site: cells made bigger to fit the air column.' : '') +
+        (g.clipped ? '. Some towers or hills here are taller than that: the model cuts them off at its lid.' : '');
+    }
+    const why = S.engineNote ? ` ${S.engineNote}` : '';
+    return (solver.kind === 'gpu'
+      ? `2D slice on the graphics card (WebGL2) · ${solver.N} x ${solver.N} cells, ${(DOMAIN_M / solver.N).toFixed(1)} m each`
+      : `2D slice on the processor (no WebGL2 float support) · ${solver.N} x ${solver.N} cells, ${(DOMAIN_M / solver.N).toFixed(1)} m each`) + why;
+  }
+  function syncQualityLabels() {
+    const q = $('#hkwQuality'); if (!q) return;
+    const lab = S.engine === '3d'
+      ? { light: 'Light: 96 x 96 cells across (6.3 m)', normal: 'Normal: 128 x 128 cells across (4.7 m)', fine: 'Fine: 160 x 160 cells across (3.8 m)' }
+      : { light: 'Light: 240 x 240 cells (2.5 m)', normal: 'Normal: 300 x 300 cells (2 m)', fine: 'Fine: 400 x 400 cells (1.5 m)' };
+    for (const o of q.options) o.textContent = lab[o.value];
+    root.querySelectorAll('[data-wengine]').forEach((b) => b.classList.toggle('on', b.dataset.wengine === S.engine));
+  }
 
+  // the 2D (v2) solver; the 3D one is made per site in prepare3d()
   function newSolver() {
-    if (solver) solver.dispose();
+    if (solver && solver.kind !== '3d') solver.dispose();
     const N = QUALITY[S.quality] || 300;
     solver = forceCPU() ? null : makeGPU(N);
     if (!solver) solver = makeCPU(CPU_N);
     S.spf = solver.kind === 'gpu' ? 20 : 3;
-    engineEl.textContent = solver.kind === 'gpu'
-      ? `Graphics card (WebGL2) · ${solver.N} x ${solver.N} cells, ${(DOMAIN_M / solver.N).toFixed(1)} m each`
-      : `Processor only (no WebGL2 float support) · ${solver.N} x ${solver.N} cells, ${(DOMAIN_M / solver.N).toFixed(1)} m each`;
-    $('#hkwQuality').disabled = solver.kind !== 'gpu';
+    engineEl.textContent = engineText();
+    $('#hkwQuality').disabled = solver.kind === 'cpu';
   }
 
   // ---------------------------------------------------------------- geometry
-  function userPoly(u) {
-    const a = u.rot * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
-    return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([px, py]) => {
-      const x = px * u.w / 2, y = py * u.d / 2;
-      return [u.cx + x * c - y * s, u.cy + x * s + y * c];
-    });
-  }
+  // user buildings are free polygons {id, poly: [[x, y], ...] (local metres, not closed), h}
+  const userPoly = (u) => u.poly;
   const blocks = (b) => b.h >= BLOCK_MIN_H && b.type !== 'Open-sided Structure';
+  function polyArea(P) { let a = 0; for (let i = 0, j = P.length - 1; i < P.length; j = i++) a += (P[j][0] + P[i][0]) * (P[j][1] - P[i][1]); return a / 2; }
+  function polyCentroid(P) {
+    let A = 0, cx = 0, cy = 0;
+    for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const f = P[j][0] * P[i][1] - P[i][0] * P[j][1]; A += f; cx += (P[j][0] + P[i][0]) * f; cy += (P[j][1] + P[i][1]) * f; }
+    if (Math.abs(A) < 1e-9) return P[0].slice();
+    return [cx / (3 * A), cy / (3 * A)];
+  }
+  function segX(a, b, c, d) {
+    const o = (p, q, r) => Math.sign((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]));
+    return o(a, b, c) * o(a, b, d) < 0 && o(c, d, a) * o(c, d, b) < 0;
+  }
+  function polySelfX(P) {
+    const n = P.length;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      if (j === i + 1 || (i === 0 && j === n - 1)) continue;
+      if (segX(P[i], P[(i + 1) % n], P[j], P[(j + 1) % n])) return true;
+    }
+    return false;
+  }
   function pathRing(ctx, ring, k) {
     ctx.moveTo(ring[0][0] * k, ring[0][1] * k);
     for (let i = 1; i < ring.length; i++) ctx.lineTo(ring[i][0] * k, ring[i][1] * k);
     ctx.closePath();
   }
+  // terrain: S.terrain = {n, step, z (mPD, rows north to south), min, max, mean, source}
+  function groundAt(x, y) {
+    const g = S.terrain; if (!g) return 0;
+    const fx = Math.min(g.n - 1.0001, Math.max(0, x / g.step)), fy = Math.min(g.n - 1.0001, Math.max(0, y / g.step));
+    const i = Math.floor(fx), j = Math.floor(fy), tx = fx - i, ty = fy - j, n = g.n;
+    return g.z[j * n + i] * (1 - tx) * (1 - ty) + g.z[j * n + i + 1] * tx * (1 - ty) + g.z[(j + 1) * n + i] * (1 - tx) * ty + g.z[(j + 1) * n + i + 1] * tx * ty;
+  }
+  // a drawn building stands on the lowest ground under its outline
+  function userBase(u) { let m = Infinity; for (const [x, y] of u.poly) m = Math.min(m, groundAt(x, y)); const c = polyCentroid(u.poly); m = Math.min(m, groundAt(c[0], c[1])); return isFinite(m) ? m : 0; }
   function rebuildMask() {
+    if (solver && solver.kind === '3d') { rebuildColumns(); need3d.user = true; return; }
     const N = solver.N;
     const oc = rebuildMask.c || (rebuildMask.c = document.createElement('canvas'));
     oc.width = oc.height = N;
@@ -365,13 +428,64 @@ void main(){
     const k = N / DOMAIN_M;
     c.beginPath();
     for (const b of buildings) if (blocks(b) && !S.removed.has(b.id)) for (const r of b.rings) pathRing(c, r, k);
-    for (const u of S.user) pathRing(c, userPoly(u), k);
+    for (const u of S.user) pathRing(c, u.poly, k);
     c.fill('nonzero');
     need3d.user = true;
     const px = c.getImageData(0, 0, N, N).data;
     maskArr = new Uint8Array(N * N);
     for (let i = 0; i < N * N; i++) maskArr[i] = px[i * 4 + 3] >= 128 ? 1 : 0;
     solver.setMask(maskArr);
+  }
+  // 3D: per ground column, solid cells = terrain + the tallest building standing on it (a 2.5D height field)
+  // On steep or very tall sites the air column must be taller; to stay inside the cell budget the
+  // cells then get bigger (fewer across) rather than the hill or the towers being cut off.
+  function dims3() {
+    const t = S.terrain || { min: 0, max: 0 }, budget = BUDGET3[S.quality] || 1.15e6;
+    let maxTop = t.max;
+    for (const b of buildings) if (blocks(b)) maxTop = Math.max(maxTop, b.top != null ? b.top : t.min + b.h);
+    const need = Math.max((maxTop - t.min) + Math.max(60, 0.5 * (maxTop - t.min)), 170);
+    const dxMin = DOMAIN_M / (Q3[S.quality] || 128);
+    const dxFit = Math.cbrt(DOMAIN_M * DOMAIN_M * need / budget);
+    let nx = Math.floor(DOMAIN_M / Math.max(dxMin, dxFit) / 8) * 8;
+    nx = Math.max(64, Math.min(Q3[S.quality] || 128, nx));
+    const dx = DOMAIN_M / nx, zFloor = t.min - dx;
+    const nzMax = Math.max(24, Math.floor(budget / (nx * nx) / 8) * 8);
+    const nz = Math.min(nzMax, Math.max(24, Math.ceil((need + dx) / dx / 8) * 8));
+    return { nx, ny: nx, nz, dx, zFloor, coarsened: nx < (Q3[S.quality] || 128), clipped: maxTop > zFloor + nz * dx };
+  }
+  function rebuildColumns() {
+    const { nx, ny, nz, dx, zFloor } = g3, NC = nx * ny;
+    const gnd = new Float32Array(NC), top = new Float32Array(NC), cover = new Uint8Array(NC);
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const z = groundAt((i + 0.5) * dx, (j + 0.5) * dx); gnd[j * nx + i] = z; top[j * nx + i] = z; }
+    const stamp = (rings, bb, zTop) => {
+      const i0 = Math.max(0, Math.floor(bb[0] / dx)), i1 = Math.min(nx - 1, Math.ceil(bb[2] / dx));
+      const j0 = Math.max(0, Math.floor(bb[1] / dx)), j1 = Math.min(ny - 1, Math.ceil(bb[3] / dx));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const x = (i + 0.5) * dx, y = (j + 0.5) * dx;
+        if (rings.some((r) => inPoly(x, y, r))) { const k = j * nx + i; cover[k] = 1; if (zTop > top[k]) top[k] = zTop; }
+      }
+    };
+    for (const b of buildings) {
+      if (!blocks(b) || S.removed.has(b.id)) continue;
+      stamp(b.rings, b.bb, b.top != null ? b.top : groundAt((b.bb[0] + b.bb[2]) / 2, (b.bb[1] + b.bb[3]) / 2) + b.h);
+    }
+    for (const u of S.user) {
+      let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (const [x, y] of u.poly) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+      stamp([u.poly], [x0, y0, x1, y1], userBase(u) + u.h);
+    }
+    const h32 = new Uint32Array(NC), hG = new Uint16Array(NC), hT = new Uint16Array(NC);
+    maskArr = new Uint8Array(NC);
+    for (let k = 0; k < NC; k++) {
+      const g = Math.min(nz - 2, Math.max(1, Math.round((gnd[k] - zFloor) / dx)));
+      let t = Math.max(g, Math.round((top[k] - zFloor) / dx));
+      if (cover[k] && t <= g) t = g + 1;
+      t = Math.min(nz, t);
+      hG[k] = g; hT[k] = t; h32[k] = t | (g << 16);
+      maskArr[k] = t > g ? 1 : 0;
+    }
+    g3.hG = hG; g3.hT = hT;
+    s3.setHeights(h32);
   }
   function inPoly(x, y, ring) {
     let ins = false;
@@ -381,7 +495,7 @@ void main(){
     }
     return ins;
   }
-  function hitUser(x, y) { for (let i = S.user.length - 1; i >= 0; i--) if (inPoly(x, y, userPoly(S.user[i]))) return S.user[i]; return null; }
+  function hitUser(x, y) { for (let i = S.user.length - 1; i >= 0; i--) if (inPoly(x, y, S.user[i].poly)) return S.user[i]; return null; }
   function hitBuilding(x, y) {
     let best = null;
     for (const b of buildings) {
@@ -411,12 +525,42 @@ void main(){
     if (t) return t === 'dark';
     return window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches;
   }
+  // 5 m terrain contours in plan (10 m drawn heavier), cached per site
+  function contourSegs() {
+    const g = S.terrain; if (!g) return [];
+    if (g._segs) return g._segs;
+    const n = g.n, segs = [];
+    if (g.max - g.min >= 4) {
+      for (let lev = Math.ceil(g.min / 5) * 5; lev <= g.max; lev += 5) {
+        const major = lev % 10 === 0, L = [];
+        for (let j = 0; j < n - 1; j++) for (let i = 0; i < n - 1; i++) {
+          const c = [[i, j], [i + 1, j], [i + 1, j + 1], [i, j + 1]].map(([a2, b2]) => [a2, b2, g.z[b2 * n + a2]]);
+          const pts = [];
+          for (let k = 0; k < 4; k++) {
+            const p1 = c[k], p2 = c[(k + 1) % 4];
+            if ((p1[2] < lev) !== (p2[2] < lev)) { const t = (lev - p1[2]) / (p2[2] - p1[2]); pts.push([(p1[0] + (p2[0] - p1[0]) * t) * g.step, (p1[1] + (p2[1] - p1[1]) * t) * g.step]); }
+          }
+          if (pts.length >= 2) L.push(pts[0], pts[1]);
+          if (pts.length === 4) L.push(pts[2], pts[3]);
+        }
+        segs.push({ lev, major, L });
+      }
+    }
+    return (g._segs = segs);
+  }
+  const handleR = () => (window.matchMedia && matchMedia('(pointer: coarse)').matches ? 11 : 6);
   function drawBuildings() {
     need3d.user = true;
     const c = ctxB, k = S.size * S.dpr / DOMAIN_M, dark = isDark();
     c.setTransform(1, 0, 0, 1, 0, 0);
     c.clearRect(0, 0, cvBld.width, cvBld.height);
     c.lineJoin = 'round';
+    for (const sg of contourSegs()) {
+      c.beginPath();
+      for (let i = 0; i < sg.L.length; i += 2) { c.moveTo(sg.L[i][0] * k, sg.L[i][1] * k); c.lineTo(sg.L[i + 1][0] * k, sg.L[i + 1][1] * k); }
+      c.strokeStyle = dark ? `rgba(255,255,255,${sg.major ? 0.32 : 0.16})` : `rgba(40,38,34,${sg.major ? 0.34 : 0.16})`;
+      c.lineWidth = (sg.major ? 0.9 : 0.6) * S.dpr; c.stroke();
+    }
     const sorted = buildings.slice().sort((a, b) => a.h - b.h);
     for (const b of sorted) {
       c.beginPath(); for (const r of b.rings) pathRing(c, r, k);
@@ -430,15 +574,50 @@ void main(){
       }
     }
     for (const u of S.user) {
-      c.beginPath(); pathRing(c, userPoly(u), k);
+      c.beginPath(); pathRing(c, u.poly, k);
       c.fillStyle = 'rgba(217,119,87,.92)'; c.fill();
-      c.strokeStyle = u === S.sel ? '#111' : '#7a3a22'; c.lineWidth = (u === S.sel ? 2.4 : 1.2) * S.dpr; c.stroke();
+      c.strokeStyle = u === S.sel ? '#111' : '#7a3a22'; c.lineWidth = (u === S.sel ? 2.2 : 1.2) * S.dpr; c.stroke();
+      const ce = polyCentroid(u.poly);
       c.fillStyle = '#fff'; c.font = `600 ${11 * S.dpr}px ui-sans-serif,system-ui,sans-serif`; c.textAlign = 'center'; c.textBaseline = 'middle';
-      c.fillText(`${u.h} m`, u.cx * k, u.cy * k);
+      c.fillText(`${u.h} m`, ce[0] * k, ce[1] * k);
     }
-    if (S.draft) {
-      c.beginPath(); pathRing(c, userPoly(S.draft), k);
-      c.setLineDash([5 * S.dpr, 4 * S.dpr]); c.strokeStyle = '#d97757'; c.lineWidth = 2 * S.dpr; c.stroke(); c.setLineDash([]);
+    // handles on the selected drawn building: squares on corners, small circles at edge midpoints (drag one to add a corner)
+    if (S.sel && S.mode === 'look') {
+      const P = S.sel.poly, r = handleR() * S.dpr;
+      for (let i = 0; i < P.length; i++) {
+        const a = P[i], b = P[(i + 1) % P.length], mx = (a[0] + b[0]) / 2 * k, my = (a[1] + b[1]) / 2 * k;
+        if (Math.hypot((b[0] - a[0]) * k, (b[1] - a[1]) * k) >= 26 * S.dpr) {
+          c.beginPath(); c.arc(mx, my, r * 0.55, 0, Math.PI * 2); c.fillStyle = 'rgba(255,255,255,.9)'; c.fill(); c.strokeStyle = '#7a3a22'; c.lineWidth = 1 * S.dpr; c.stroke();
+        }
+      }
+      P.forEach(([x, y], i) => {
+        c.fillStyle = i === S.selV ? '#111' : '#fff'; c.strokeStyle = '#111'; c.lineWidth = 1.2 * S.dpr;
+        c.fillRect(x * k - r / 2, y * k - r / 2, r, r); c.strokeRect(x * k - r / 2, y * k - r / 2, r, r);
+      });
+    }
+    // the outline being drawn: placed points, rubber band to the cursor, close hint on the first point
+    const D = S.draft;
+    if (D) {
+      const pts = D.rect ? rectPts(D.pts[0], D.cur) : D.pts.concat([D.cur]);
+      c.beginPath(); c.moveTo(pts[0][0] * k, pts[0][1] * k);
+      for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0] * k, pts[i][1] * k);
+      if (D.rect) c.closePath();
+      c.fillStyle = 'rgba(217,119,87,.18)'; if (pts.length >= 3) c.fill();
+      c.setLineDash([5 * S.dpr, 4 * S.dpr]); c.strokeStyle = '#c4552f'; c.lineWidth = 2 * S.dpr; c.stroke(); c.setLineDash([]);
+      if (!D.rect && D.pts.length >= 2) {   // faint closing edge
+        c.beginPath(); c.moveTo(D.cur[0] * k, D.cur[1] * k); c.lineTo(D.pts[0][0] * k, D.pts[0][1] * k);
+        c.setLineDash([2 * S.dpr, 4 * S.dpr]); c.strokeStyle = 'rgba(196,85,47,.55)'; c.lineWidth = 1.2 * S.dpr; c.stroke(); c.setLineDash([]);
+      }
+      const r = handleR() * S.dpr;
+      D.pts.forEach(([x, y], i) => {
+        c.fillStyle = i === 0 && D.closeHint ? '#c4552f' : '#fff'; c.strokeStyle = '#c4552f'; c.lineWidth = 1.4 * S.dpr;
+        c.fillRect(x * k - r / 2, y * k - r / 2, r, r); c.strokeRect(x * k - r / 2, y * k - r / 2, r, r);
+      });
+      if (D.snapped) { c.beginPath(); c.arc(D.cur[0] * k, D.cur[1] * k, r, 0, Math.PI * 2); c.strokeStyle = '#1d6fb8'; c.lineWidth = 1.4 * S.dpr; c.stroke(); }
+      if (D.guide) {   // alignment guide to the first point
+        c.beginPath(); c.moveTo(D.guide[0][0] * k, D.guide[0][1] * k); c.lineTo(D.guide[1][0] * k, D.guide[1][1] * k);
+        c.setLineDash([3 * S.dpr, 3 * S.dpr]); c.strokeStyle = '#1d6fb8'; c.lineWidth = 1 * S.dpr; c.stroke(); c.setLineDash([]);
+      }
     }
   }
 
@@ -453,6 +632,22 @@ void main(){
       const sp = Math.hypot(buf[o + 1], buf[o + 2]) * inv;
       const li = Math.min(255, (sp * sc) | 0) * 3;
       d[o] = LUT[li]; d[o + 1] = LUT[li + 1]; d[o + 2] = LUT[li + 2]; d[o + 3] = 255;
+    }
+    // 3D cells are coarse: give solid cells their fluid neighbours' colour so no pale halo shows round the footprints
+    if (solver.kind === '3d') {
+      for (let pass = 0; pass < 2; pass++) {
+        const src = new Uint8ClampedArray(d);
+        for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+          const o = (y * N + x) * 4; if (src[o + 3]) continue;
+          let r = 0, g = 0, b = 0, n = 0;
+          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= N || yy >= N) continue;
+            const q = (yy * N + xx) * 4; if (!src[q + 3]) continue;
+            r += src[q]; g += src[q + 1]; b += src[q + 2]; n++;
+          }
+          if (n) { d[o] = r / n; d[o + 1] = g / n; d[o + 2] = b / n; d[o + 3] = 255; }
+        }
+      }
     }
     ctxF.putImageData(S.field, 0, 0);
   }
@@ -479,8 +674,9 @@ void main(){
     p.x = Math.random() * DOMAIN_M; p.y = Math.random() * DOMAIN_M; p.age = 0; p.fresh = true; return p;
   }
   function resetParticles() {
-    const n = solver.kind === 'gpu' ? 2600 : 1400;
+    const n = solver.kind === 'gpu' ? 2600 : solver.kind === '3d' ? 2000 : 1400;
     particles = Array.from({ length: n }, () => seedParticle({}));
+    parts3 = [];
     ctxT.setTransform(1, 0, 0, 1, 0, 0); ctxT.clearRect(0, 0, cvTrail.width, cvTrail.height);
   }
   function moveParticles(buf, steps) {
@@ -504,19 +700,256 @@ void main(){
       p.x = nx; p.y = ny;
     }
     if (draw2d) c.stroke();
-    if (view3d && S.view === '3d') view3d.pushParticles(particles, S.showParticles);
+    if (view3d && S.view === '3d') {
+      if (solver.kind === '3d') move3d(steps);
+      else view3d.pushParticles(particles, S.showParticles);
+    }
   }
 
+  // ---------------------------------------------------------------- 3D field helpers
+  const prof3 = (zaglCells) => (zaglCells >= ZREF_M / g3.dx ? 1 : Math.pow(Math.max(zaglCells, 0.05) / (ZREF_M / g3.dx), ALPHA));
+  // pedestrian slice: the first fluid cell above the terrain (centre about dx/2 = 2-3 m up), as a v2-style 2D buffer,
+  // scaled so that the undisturbed incoming wind at that height reads 1 (same meaning as the v2 colours)
+  function fillSlice(f) {
+    const { nx, ny } = g3, NC = nx * ny;
+    if (!slice.buf || slice.buf.length !== NC * 4) slice.buf = new Float32Array(NC * 4);
+    const b = slice.buf, u = inflow(S.dirIdx), sc = U0 / (UREF * prof3(0.5));
+    for (let k = 0; k < NC; k++) {
+      const o = k * 4;
+      if (maskArr && maskArr[k]) { b[o + 1] = 0; b[o + 2] = 0; b[o + 3] = -1; continue; }
+      if (!f) { b[o + 1] = u[0]; b[o + 2] = u[1]; b[o + 3] = 1; continue; }
+      const q = (g3.hG[k] * ny * nx + k) * 4;          // ((z*ny + y)*nx + x) with k = y*nx + x
+      b[o + 1] = f[q] * sc; b[o + 2] = f[q + 1] * sc; b[o + 3] = f[q + 3] < 0 ? -1 : 1;
+    }
+  }
+  function solid3(x, y, zl) {     // zl = level in mPD
+    const { nx, dx, zFloor } = g3;
+    const i = Math.floor(x / dx), j = Math.floor(y / dx);
+    if (i < 0 || j < 0 || i >= nx || j >= g3.ny) return true;
+    return Math.floor((zl - zFloor) / dx) < g3.hT[j * nx + i];
+  }
+  // trilinear velocity (lattice units) at local metres x, y and level zl (mPD); null inside solids or outside
+  function f3at(x, y, zl) {
+    const f = field3; if (!f) return null;
+    const { nx, ny, nz, dx, zFloor } = g3;
+    if (x < 0 || y < 0 || x >= DOMAIN_M || y >= DOMAIN_M || solid3(x, y, zl)) return null;
+    const gx = x / dx - 0.5, gy = y / dx - 0.5, gz = Math.min(nz - 1.001, (zl - zFloor) / dx - 0.5);
+    if (gz < 0) return null;
+    const i0 = Math.max(0, Math.min(nx - 2, Math.floor(gx))), j0 = Math.max(0, Math.min(ny - 2, Math.floor(gy))), k0 = Math.max(0, Math.min(nz - 2, Math.floor(gz)));
+    const tx = Math.min(1, Math.max(0, gx - i0)), ty = Math.min(1, Math.max(0, gy - j0)), tz = Math.min(1, Math.max(0, gz - k0));
+    let ux = 0, uy = 0, uz = 0;
+    for (let c = 0; c < 8; c++) {
+      const di = c & 1, dj = (c >> 1) & 1, dk = c >> 2;
+      const w = (di ? tx : 1 - tx) * (dj ? ty : 1 - ty) * (dk ? tz : 1 - tz);
+      const o = (((k0 + dk) * ny + j0 + dj) * nx + i0 + di) * 4;
+      if (f[o + 3] < 0) continue;                       // wall: no-slip, counts as zero velocity
+      ux += f[o] * w; uy += f[o + 1] * w; uz += f[o + 2] * w;
+    }
+    return [ux, uy, uz];
+  }
+  const LINE_SLOW = [150, 196, 232], LINE_FAST = [8, 44, 118];
+  function lineColour(sp) {
+    const t = Math.min(1, Math.max(0, sp / (UREF * 1.15)));
+    return [0, 1, 2].map((i) => (LINE_SLOW[i] + (LINE_FAST[i] - LINE_SLOW[i]) * t) / 255);
+  }
+  function seed3(p) {
+    for (let tries = 0; tries < 30; tries++) {
+      const x = Math.random() * DOMAIN_M, y = Math.random() * DOMAIN_M;
+      const h = Math.random() < 0.6 ? 2 + Math.random() * 30 : 30 + Math.random() * 120;
+      const zl = groundAt(x, y) + h;
+      if (!solid3(x, y, zl)) { p.x = x; p.y = y; p.zl = zl; p.age = Math.floor(Math.random() * 90); p.fresh = true; return p; }
+    }
+    p.x = Math.random() * DOMAIN_M; p.y = Math.random() * DOMAIN_M; p.zl = (S.terrain ? S.terrain.max : 0) + 60; p.age = 0; p.fresh = true; return p;
+  }
+  function move3d(steps) {
+    const n = S.quality === 'light' || isPhone() ? 900 : 1600;
+    if (parts3.length !== n) parts3 = Array.from({ length: n }, () => seed3({}));
+    if (!field3) return;
+    const gain = steps * g3.dx * 0.6, zRef = S.terrain ? S.terrain.min : 0;
+    for (const p of parts3) {
+      const u = f3at(p.x, p.y, p.zl);
+      p.age++;
+      if (!u || p.age > 160) { seed3(p); p.age = 0; }
+      else {
+        p.x += u[0] * gain; p.y += u[1] * gain; p.zl += u[2] * gain;
+        if (p.x < 0 || p.y < 0 || p.x >= DOMAIN_M || p.y >= DOMAIN_M) { seed3(p); p.age = 0; }
+        else p.c = lineColour(Math.hypot(u[0], u[1], u[2]));
+      }
+      p.z = p.zl - zRef;
+    }
+    view3d.pushParticles(parts3, S.showParticles);
+  }
+  // streamlines from a rake along the upwind edge, several heights above the ground
+  function traceLines() {
+    if (!field3 || !view3d) return;
+    const b = S.dirIdx * 22.5 * Math.PI / 180, dw = [-Math.sin(b), Math.cos(b)], pp = [-dw[1], dw[0]], H = DOMAIN_M / 2;
+    const inside = (x, y) => x >= 0.5 && y >= 0.5 && x <= DOMAIN_M - 0.5 && y <= DOMAIN_M - 0.5;
+    const pos = [], col = [], zRef = S.terrain ? S.terrain.min : 0, ds = g3.dx * 0.6;
+    const lateral = S.quality === 'light' ? 18 : 26, heights = [3, 9, 18, 32, 55, 100];
+    for (let a = 0; a < lateral; a++) {
+      const sOff = -H * 0.96 + (a + 0.5) * (1.92 * H / lateral);
+      let x = H + pp[0] * sOff, y = H + pp[1] * sOff;
+      if (!inside(x, y)) continue;
+      while (inside(x - dw[0] * 4, y - dw[1] * 4)) { x -= dw[0] * 4; y -= dw[1] * 4; }
+      x += dw[0] * g3.dx * 8; y += dw[1] * g3.dx * 8;           // start just inside the sponge layer
+      for (const h of heights) {
+        let px = x, py = y, pz = groundAt(x, y) + h;
+        for (let k = 0; k < 520; k++) {
+          const u1 = f3at(px, py, pz); if (!u1) break;
+          const s1 = Math.hypot(u1[0], u1[1], u1[2]); if (s1 < 0.003) break;
+          const mx = px + u1[0] / s1 * ds * 0.5, my = py + u1[1] / s1 * ds * 0.5, mz = pz + u1[2] / s1 * ds * 0.5;
+          const u2 = f3at(mx, my, mz) || u1; const s2 = Math.hypot(u2[0], u2[1], u2[2]) || s1;
+          const nx2 = px + u2[0] / s2 * ds, ny2 = py + u2[1] / s2 * ds, nz2 = pz + u2[2] / s2 * ds;
+          if (!inside(nx2, ny2)) break;
+          const c = lineColour(s2);
+          pos.push(px - H, pz - zRef, py - H, nx2 - H, nz2 - zRef, ny2 - H);
+          col.push(c[0], c[1], c[2], 0.9, c[0], c[1], c[2], 0.9);
+          px = nx2; py = ny2; pz = nz2;
+        }
+      }
+    }
+    S.lines3 = new Float32Array(pos);
+    view3d.setStreamlines(S.lines3, new Float32Array(col), S.showLines);
+    S.lineSegs = pos.length / 6;
+  }
+  // for the automated check: streamline segments that pass over a footprint (above its roof) or beside it (below the roof)
+  window.HKW.overAround = (poly, roof, near) => {
+    const L = S.lines3; if (!L) return null;
+    const H = DOMAIN_M / 2, zRef = S.terrain ? S.terrain.min : 0, nr = near || 12;
+    const distOut = (x, y) => { let d = Infinity; for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i + 1) % poly.length], vx = b[0] - a[0], vy = b[1] - a[1], t = Math.max(0, Math.min(1, ((x - a[0]) * vx + (y - a[1]) * vy) / (vx * vx + vy * vy))); d = Math.min(d, Math.hypot(a[0] + vx * t - x, a[1] + vy * t - y)); } return d; };
+    let over = 0, around = 0, inside = 0;
+    for (let i = 0; i < L.length; i += 6) {
+      const x = (L[i] + L[i + 3]) / 2 + H, z = (L[i + 1] + L[i + 4]) / 2 + zRef, y = (L[i + 2] + L[i + 5]) / 2 + H;
+      const ins = inPoly(x, y, poly);
+      if (ins && z > roof) over++;
+      else if (ins) inside++;
+      else if (z < roof - 3 && distOut(x, y) < nr) around++;
+    }
+    return { over, around, insideBelowRoof: inside, segments: L.length / 6 };
+  };
+  // vertical section along the wind through the middle (moved sideways by the slider)
+  const secCanvas = document.createElement('canvas');
+  function paintSection() {
+    if (!view3d) return;
+    if (!S.showSection || !field3 || !solver || solver.kind !== '3d') { view3d.setSection(null); return; }
+    const b = S.dirIdx * 22.5 * Math.PI / 180, dw = [-Math.sin(b), Math.cos(b)], pp = [-dw[1], dw[0]], H = DOMAIN_M / 2;
+    const cx = H + pp[0] * S.sectionOff, cy = H + pp[1] * S.sectionOff;
+    let t0 = -1e9, t1 = 1e9;                     // where the line through (cx, cy) along the wind leaves the square
+    for (const [p0, d] of [[cx, dw[0]], [cy, dw[1]]]) {
+      if (Math.abs(d) < 1e-9) { if (p0 < 0 || p0 > DOMAIN_M) { view3d.setSection(null); return; } continue; }
+      const a1 = (0 - p0) / d, a2 = (DOMAIN_M - p0) / d; t0 = Math.max(t0, Math.min(a1, a2)); t1 = Math.min(t1, Math.max(a1, a2));
+    }
+    if (t1 - t0 < 50) { view3d.setSection(null); return; }
+    const W = 200, Hh = g3.nz * 2, zRef = S.terrain ? S.terrain.min : 0;
+    secCanvas.width = W; secCanvas.height = Hh;
+    const ctx = secCanvas.getContext('2d'), img = ctx.createImageData(W, Hh), d = img.data;
+    const top = g3.zFloor + g3.nz * g3.dx;
+    for (let i = 0; i < W; i++) {
+      const t = t0 + (t1 - t0) * (i + 0.5) / W, x = cx + dw[0] * t, y = cy + dw[1] * t, gz = groundAt(x, y);
+      for (let r = 0; r < Hh; r++) {
+        const zl = top - (r + 0.5) / Hh * (top - g3.zFloor), o = (r * W + i) * 4;
+        const u = f3at(x, y, zl);
+        if (!u) { if (zl < top - g3.dx) { d[o] = 58; d[o + 1] = 56; d[o + 2] = 52; d[o + 3] = 235; } else d[o + 3] = 0; continue; }
+        const ratio = Math.hypot(u[0], u[1], u[2]) / (UREF * prof3(Math.max(0.5, (zl - gz) / g3.dx)));
+        const li = Math.min(255, (ratio * 255 / LUT_MAX) | 0) * 3;
+        d[o] = LUT[li]; d[o + 1] = LUT[li + 1]; d[o + 2] = LUT[li + 2]; d[o + 3] = 225;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    view3d.setSection({ canvas: secCanvas, a: [cx + dw[0] * t0, cy + dw[1] * t0], b: [cx + dw[0] * t1, cy + dw[1] * t1], y0: g3.zFloor - zRef, y1: top - zRef });
+  }
+  // numbers for the automated check
+  window.HKW.stats3 = () => {
+    const f = field3; if (!f || !g3 || !s3) return null;
+    const { nx, ny, nz } = g3, NC = nx * ny * nz;
+    let nan = 0, solidVel = 0, nSolid = 0, mass = 0, nf = 0, maxU = 0, wrongSolid = 0;
+    for (let c = 0; c < NC; c++) {
+      const o = c * 4, r = f[o + 3];
+      const x = c % nx, y = Math.floor(c / nx) % ny, z = Math.floor(c / (nx * ny));
+      const shouldSolid = z < g3.hT[y * nx + x];
+      if (r < 0) { nSolid++; if (!shouldSolid) wrongSolid++; if (f[o] || f[o + 1] || f[o + 2]) solidVel++; continue; }
+      if (shouldSolid) wrongSolid++;
+      if (!isFinite(r) || !isFinite(f[o]) || !isFinite(f[o + 1]) || !isFinite(f[o + 2])) { nan++; continue; }
+      mass += r; nf++; const sp = Math.hypot(f[o], f[o + 1], f[o + 2]); if (sp > maxU) maxU = sp;
+    }
+    return { kind: s3.kind, nx, ny, nz, dx: +g3.dx.toFixed(2), steps: S.steps, cells: NC, solidCells: nSolid, wrongSolid, solidWithVelocity: solidVel, nan,
+      meanRho: +(mass / Math.max(1, nf)).toFixed(5), maxSpeedRatio: +(maxU / UREF).toFixed(2), lineSegs: S.lineSegs || 0, clipped: !!g3.clipped };
+  };
+  // velocity at a point for tests: [ux, uy, uz] relative to the reference wind
+  window.HKW.vel3 = (x, y, hAboveGround) => { const u = f3at(x, y, groundAt(x, y) + hAboveGround); return u ? u.map((v) => +(v / UREF).toFixed(3)) : null; };
+  window.HKW.groundAt = (x, y) => groundAt(x, y);
+  window.HKW.debug3 = () => ({ readBusy, readAgeMs: Math.round(performance.now() - field3At), field: !!field3, busy: s3 ? s3.busy : null, steps: S.steps, spf: S.spf, preparing: !!S.preparing, token: flowToken });
+
   // ---------------------------------------------------------------- loop
-  let lastFrame = 0, fpsAcc = 0, fpsN = 0, fpsT = performance.now();
+  let lastFrame = 0, fpsAcc = 0, fpsN = 0, fpsT = performance.now(), stepsT = 0, stepEMA = 8;
+  // How long one solver step takes on this device: time a short and a long batch twice, so the fixed
+  // delay before the browser reports "done" cancels out. Run once per new solver.
+  async function calibrate3d(s) {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const timed = async (n) => {
+      while (s.busy) await sleep(2);
+      const t0 = performance.now(); s.step(n);
+      while (s.busy) await sleep(1);
+      return performance.now() - t0;
+    };
+    await timed(2);
+    const a1 = await timed(4), b1 = await timed(20), a2 = await timed(4), b2 = await timed(20);
+    const per = Math.max(0.2, ((b1 + b2) - (a1 + a2)) / 32);
+    s.msPerStep = per;
+    return { per, steps: 50 };
+  }
+  let busySkips = 0, busyFrames = 0;
+  function readBack3d(now) {
+    if (readBusy || now - field3At <= READ_MS || S.steps <= 0) return;
+    readBusy = true; const tok = flowToken, t0 = now;
+    readT0 = t0;
+    s3.readField().then((f) => {
+      readBusy = false;
+      if (!f || tok !== flowToken) return;
+      field3 = f; field3At = performance.now(); onField3();
+    }).catch((e) => { readBusy = false; console.warn('[wind] reading the 3D field failed:', e.message); });
+  }
+  let readT0 = 0;
+  function step3d(now) {
+    readBack3d(now);                    // copy the field back for drawing, whether or not the solver is busy
+    if (s3.busy) {                      // the GPU has not finished the last batch: skip, and ease off if it keeps happening
+      busySkips++; busyFrames++;
+      if (busyFrames > 15 && busySkips / busyFrames > 0.3) { S.spf = Math.max(2, Math.floor(S.spf * 0.85)); busySkips = busyFrames = 0; }
+      moveParticles(slice.buf, Math.max(1, stepEMA)); stepEMA *= 0.9;
+      return;
+    }
+    busyFrames++;
+    const n = s3.step(S.spf);
+    if (n) S.steps += n;
+    stepEMA = stepEMA * 0.85 + n * 0.15;
+    moveParticles(slice.buf, Math.max(1, stepEMA));
+  }
+  function onField3() {
+    fillSlice(field3);
+    if (S.showField) { paintField(slice.buf); if (view3d) view3d.markField(); }
+    if (view3d && S.view === '3d') {
+      const now = performance.now();
+      if (now - lines3At > 450) { traceLines(); lines3At = now; }
+      if (S.showSection) paintSection();
+    }
+  }
   function frame(now) {
     requestAnimationFrame(frame);
     if (document.hidden) return;                       // pause when the tab is hidden
     if (now - lastFrame < 1000 / FPS_CAP - 2) return;  // frame cap
     lastFrame = now;
     if (S.running && now - S.lastTouch > IDLE_PAUSE_MS) { S.running = false; S.idlePaused = true; syncRun(); }
-    if (solver && S.data && !S.loading && S.running) {
-      if (solver.lost) { console.warn('[wind] GPU context lost, switching to CPU'); params.set('engine', 'cpu'); restart(); return; }
+    if (solver && S.data && !S.loading && !S.preparing && S.running) {
+      if (solver.lost) {
+        if (solver.kind === '3d') {
+          console.warn('[wind] the 3D solver stopped (graphics device lost); showing the 2D slice');
+          s3Failed = true; s3 = null; S.engine = '2d'; S.engineNote = '(The graphics card stopped the 3D solver, so this shows the 2D slice.)';
+          syncQualityLabels(); restartFlow(); return;
+        }
+        console.warn('[wind] GPU context lost, switching to CPU'); params.set('engine', 'cpu'); restart(); return;
+      }
+      if (solver.kind === '3d') { step3d(now); fpsN++; }
+      else {
       const t0 = performance.now();
       solver.step(S.spf);
       S.steps += S.spf;
@@ -528,16 +961,24 @@ void main(){
       if (work > 24 && S.spf > 2) S.spf = Math.max(2, Math.floor(S.spf * 0.8));
       else if (work < 10 && S.spf < (solver.kind === 'gpu' ? 36 : 8)) S.spf += 1;
       fpsN++;
+      }
     }
     if (view3d && S.view === '3d') { sync3d(); view3d.frame(); updateNorth(); }
-    if (now - fpsT > 1000) { S.fps = fpsN * 1000 / (now - fpsT); fpsN = 0; fpsT = now; if (solver) updateStatus(); }
+    if (now - fpsT > 1000) {
+      S.fps = fpsN * 1000 / (now - fpsT); S.sps = (S.steps - stepsT) * 1000 / (now - fpsT);
+      if (S.sps < 0) S.sps = 0;
+      stepsT = S.steps; fpsN = 0; fpsT = now; if (solver && !S.preparing) updateStatus();
+    }
   }
   function updateStatus() {
-    const flow = S.steps * U0 / solver.N;      // how many times the wind has crossed the square
+    // how many times the wind has crossed the square (3D: the slower air near the ground takes longer)
+    const flow = solver.kind === '3d' ? S.steps * UREF * 0.7 / solver.N : S.steps * U0 / solver.N;
     const pct = Math.min(100, Math.round(flow / 1.5 * 100));
     settleEl.textContent = pct < 100 ? `Settling 形成中 ${pct}%` : 'Settled 已穩定 (eddies keep moving, as real wind does)';
     settleEl.classList.toggle('ok', pct >= 100);
-    statusEl.textContent = `${S.fps.toFixed(0)} fps · ${S.spf} steps per frame`;
+    statusEl.textContent = solver.kind === '3d'
+      ? `${S.fps.toFixed(0)} fps · ${Math.round(S.sps || 0)} solver steps per second`
+      : `${S.fps.toFixed(0)} fps · ${S.spf} steps per frame`;
   }
   function syncRun() {
     runBtn.textContent = S.running ? 'Pause 暫停' : 'Run 開始';
@@ -567,7 +1008,9 @@ void main(){
   async function loadArea(id) {
     if (cache[id]) return cache[id];
     const d = (window.HKW_DATA && window.HKW_DATA[id]) || await getJSON(DATA_URL + id + '.json');
-    return (cache[id] = prepBuildings(d));
+    prepBuildings(d);
+    await withTerrain(d);
+    return (cache[id] = d);
   }
 
   // any site: LandsD buildings from the CSDI web feature service, by bounding box
@@ -626,6 +1069,60 @@ void main(){
     }));
     return res;
   }
+  // terrain: LandsD 5 m digital terrain model, cut into 1 km tiles kept in this repository (prep_terrain.py)
+  let dtmIdx = null;
+  const dtmTiles = new Map();
+  function dtmTile(name) {
+    if (dtmTiles.has(name)) return dtmTiles.get(name);
+    const p = (async () => {
+      if (!dtmIdx.set.has(name)) return null;                   // no tile = sea, 0 mPD
+      const r = await fetch(DATA_URL + 'dtm/' + name + '.bin');
+      if (!r.ok) throw new Error(`terrain tile ${name}: ${r.status}`);
+      const buf = await new Response(r.body.pipeThrough(new DecompressionStream('deflate'))).arrayBuffer();
+      return new Int16Array(buf);
+    })();
+    dtmTiles.set(name, p); p.catch(() => dtmTiles.delete(name));
+    return p;
+  }
+  async function fetchTerrain(lat, lon) {
+    if (typeof DecompressionStream === 'undefined') throw new Error('this browser cannot unpack the terrain tiles');
+    if (!dtmIdx) { const d = await getJSON(DATA_URL + 'dtm/index.json'); d.set = new Set(d.tiles); dtmIdx = d; }
+    const I = dtmIdx, T = I.tile, n = 121, step = DOMAIN_M / (n - 1), kx = mPerDegLon(lat);
+    const cxy = new Float64Array(n * n * 2), need = new Set();
+    for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+      const la = lat - (j * step - DOMAIN_M / 2) / M_PER_DEG_LAT, lo = lon + (i * step - DOMAIN_M / 2) / kx;
+      const [E, N] = HK80.toGrid(la, lo);
+      const ci = (E - I.x0) / I.cell - 0.5, cj = (I.north - N) / I.cell - 0.5;     // cell-centre coordinates, rows from the north
+      cxy[(j * n + i) * 2] = ci; cxy[(j * n + i) * 2 + 1] = cj;
+      for (const a of [Math.floor(ci), Math.floor(ci) + 1]) for (const b of [Math.floor(cj), Math.floor(cj) + 1]) need.add(`${Math.floor(a / T)}_${Math.floor(b / T)}`);
+    }
+    const tiles = {};
+    await Promise.all([...need].map(async (nm) => { tiles[nm] = await dtmTile(nm); }));
+    const cell = (ci, cj) => {
+      const ti = Math.floor(ci / T), tj = Math.floor(cj / T), t = tiles[`${ti}_${tj}`];
+      return t ? t[(cj - tj * T) * T + (ci - ti * T)] : 0;
+    };
+    const z = new Float32Array(n * n);
+    let mn = Infinity, mx = -Infinity, sum = 0;
+    for (let k = 0; k < n * n; k++) {
+      const ci = cxy[k * 2], cj = cxy[k * 2 + 1], i0 = Math.floor(ci), j0 = Math.floor(cj), tx = ci - i0, ty = cj - j0;
+      const v = cell(i0, j0) * (1 - tx) * (1 - ty) + cell(i0 + 1, j0) * tx * (1 - ty) + cell(i0, j0 + 1) * (1 - tx) * ty + cell(i0 + 1, j0 + 1) * tx * ty;
+      z[k] = v; mn = Math.min(mn, v); mx = Math.max(mx, v); sum += v;
+    }
+    return { n, step, z, min: mn, max: mx, mean: sum / (n * n), source: 'dtm' };
+  }
+  // if the tiles cannot load, a flat ground at the lowest LandsD building base level (said so on the page)
+  function flatTerrain(blds) {
+    let m = Infinity; for (const b of blds) if (b.base != null) m = Math.min(m, b.base);
+    if (!isFinite(m)) m = 0;
+    return { n: 2, step: DOMAIN_M, z: new Float32Array([m, m, m, m]), min: m, max: m, mean: m, source: 'flat' };
+  }
+  async function withTerrain(d) {
+    if (d.terrain) return d;
+    try { d.terrain = await fetchTerrain(d.centre_wgs84[0], d.centre_wgs84[1]); }
+    catch (e) { console.info('[wind] terrain not loaded:', e.message); d.terrain = flatTerrain(d.buildings); d.terrainErr = e.message; }
+    return d;
+  }
   async function loadSite(lat, lon, label, onCount) {
     const key = lat.toFixed(5) + ',' + lon.toFixed(5);
     if (cache[key]) return cache[key];
@@ -633,6 +1130,7 @@ void main(){
     const d = prepBuildings({ id: key, name_en: label || 'Picked on the map', name_zh: label ? '' : '地圖揀點', live: true,
       centre_wgs84: [lat, lon], size_m: DOMAIN_M, buildings: convertFeatures(feats, lat, lon), site_wind: wind,
       fetched: new Date().toISOString().slice(0, 10) });
+    await withTerrain(d);
     return (cache[key] = d);
   }
 
@@ -698,18 +1196,23 @@ void main(){
   function escapeHTML(t) { return String(t).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
   function useData(d) {
     S.loading = false; showLoading('');
-    S.data = d; buildings = d.buildings; S.user = []; S.removed = new Set(); S.sel = null; syncSel();
-    need3d.site = true; need3d.user = true;
+    S.data = d; buildings = d.buildings; S.user = []; S.removed = new Set(); S.sel = null; S.selV = null; S.draft = null; syncSel();
+    S.terrain = d.terrain || flatTerrain(buildings);
+    need3d.site = true; need3d.user = true; need3d.terrain = true;
     const nb = buildings.filter(blocks).length;
     const sw = d.site_wind || {};
-    const windNote = sw.grid_id ? `Wind table: PlanD grid cell ${escapeHTML(sw.grid_id)}.` : 'No PlanD wind table for this point (sea or outside the grid): all 16 directions are shown as equally likely. 呢點冇 PlanD 風資料。';
+    const tr = S.terrain;
+    const terrNote = tr.source === 'dtm'
+      ? ` Ground ${tr.min.toFixed(0)} to ${tr.max.toFixed(0)} mPD (LandsD 5 m terrain model).`
+      : ` Terrain could not load (${escapeHTML(d.terrainErr || 'unknown')}): ground drawn flat at ${tr.min.toFixed(1)} mPD. 地形載入唔到，當平地計。`;
+    const windNote = (sw.grid_id ? `Wind table: PlanD grid cell ${escapeHTML(sw.grid_id)}.` : 'No PlanD wind table for this point (sea or outside the grid): all 16 directions are shown as equally likely. 呢點冇 PlanD 風資料。') + terrNote;
     if (d.live) {
       const [la, lo] = d.centre_wgs84;
       $('#hkwAreaNote').innerHTML = `<b>${escapeHTML(d.name_en)}${d.name_zh ? ' ' + escapeHTML(d.name_zh) : ''}</b> · ${la.toFixed(5)} N, ${lo.toFixed(5)} E · ${d.size_m} m x ${d.size_m} m · ` +
         `${nb} building blocks stand in the 2 m slice (of ${buildings.length} in LandsD data, fetched live ${d.fetched}). ${windNote}` +
         (buildings.length === 0 ? '<br>No buildings here: open ground or sea. 呢度冇建築物。' : '');
     } else {
-      $('#hkwAreaNote').innerHTML = `<b>${d.name_en} ${d.name_zh}</b> · ${d.size_m} m x ${d.size_m} m · ${nb} building blocks stand in the 2 m slice (of ${buildings.length} in LandsD data).<br>${d.note_en}<br>${d.note_zh}`;
+      $('#hkwAreaNote').innerHTML = `<b>${d.name_en} ${d.name_zh}</b> · ${d.size_m} m x ${d.size_m} m · ${nb} building blocks stand in the 2 m slice (of ${buildings.length} in LandsD data).${terrNote}<br>${d.note_en}<br>${d.note_zh}`;
     }
     const want = params.get('dir');
     const wi = want && S.dirIdx === null ? DIRS.findIndex(([e]) => e === want.toUpperCase()) : -1;
@@ -828,9 +1331,15 @@ void main(){
   const stateFor3d = () => ({ buildings, removed: S.removed, user: S.user, sel: S.sel, blocks });
   let lastRemovedKey = '';
   function sync3d() {
+    if (need3d.terrain && S.terrain) {
+      const t = S.terrain;
+      view3d.setTerrain({ n: t.n, step: t.step, z: t.z, zRef: t.min, zMax: t.max, zMean: t.mean });
+      need3d.terrain = false; need3d.site = true; need3d.user = true;
+      if (S.dirIdx !== null) view3d.setWind(S.dirIdx);
+    }
     const key = [...S.removed].join(',');
     if (need3d.site || key !== lastRemovedKey) { view3d.rebuild(stateFor3d(), need3d.site); need3d.site = false; lastRemovedKey = key; }
-    if (need3d.user) { view3d.rebuildUser(stateFor3d()); need3d.user = false; }
+    if (need3d.user) { for (const u of S.user) u.base = userBase(u); view3d.rebuildUser(stateFor3d()); need3d.user = false; }
   }
   function ensure3d() {
     if (!view3dLoading) {
@@ -870,10 +1379,14 @@ void main(){
     if (v === '3d') {
       view3d.resize(S.size, S.size);
       need3d.user = true;
+      sync3d();
       if (S.dirIdx !== null) view3d.setWind(S.dirIdx);
       particles.forEach((p) => { p.fresh = true; });
+      parts3.forEach((p) => { p.fresh = true; });
       view3d.showField(S.showField);
-      if (solver && S.steps > 0 && S.showField) { paintField(solver.read()); view3d.markField(); }
+      if (solver && solver.kind !== '3d' && S.steps > 0 && S.showField) { paintField(solver.read()); view3d.markField(); }
+      if (solver && solver.kind === '3d') { view3d.setStreamlines(null); if (field3) { onField3(); traceLines(); lines3At = performance.now(); } }
+      syncEngineUI();
     } else {
       ctxT.setTransform(1, 0, 0, 1, 0, 0); ctxT.clearRect(0, 0, cvTrail.width, cvTrail.height);
       drawBuildings();
@@ -896,13 +1409,14 @@ void main(){
   }
   function pick3d(hit) {
     touch();
-    if (S.mode === 'add') {
+    if (S.mode === 'draw') {
       if (hit.kind === 'user') { S.sel = hit.u; }
       else if (hit.kind === 'ground') {
-        const h = +$('#hkwNewH').value || 60;
-        const u = { id: nextUserId++, cx: Math.round(hit.x), cy: Math.round(hit.y), w: 40, d: 30, rot: 0, h };
+        const h = +$('#hkwNewH').value || 60, x = Math.round(hit.x), y = Math.round(hit.y);
+        const u = { id: nextUserId++, poly: [[x - 20, y - 15], [x + 20, y - 15], [x + 20, y + 15], [x - 20, y + 15]], h };
         S.user.push(u); S.sel = u; rebuildMask();
-      } else { placeTip(hit.ev, 'Click open ground to place a 40 x 30 m block. 撳空地放一座 40 x 30 米嘅樓。'); return; }
+        placeTip(hit.ev, 'Placed a 40 x 30 m block. Draw any outline in the Plan view. 放咗一座 40 x 30 米嘅樓；喺平面可以畫任何形狀。');
+      } else { placeTip(hit.ev, 'Click open ground to place a 40 x 30 m block, or draw any outline in the Plan view. 撳空地放樓，或者喺平面畫。'); return; }
     } else if (S.mode === 'remove') {
       if (hit.kind === 'user') { S.user = S.user.filter((v) => v !== hit.u); if (S.sel === hit.u) S.sel = null; }
       else if (hit.kind === 'building') S.removed.add(hit.b.id);
@@ -913,7 +1427,7 @@ void main(){
       }
       rebuildMask();
     } else {
-      if (hit.kind === 'user') { S.sel = hit.u; placeTip(hit.ev, `<b>Your block 你加嘅樓</b><br>${hit.u.w} m x ${hit.u.d} m, ${hit.u.h} m tall`); }
+      if (hit.kind === 'user') { S.sel = hit.u; placeTip(hit.ev, `<b>Your building 你加嘅樓</b><br>${Math.round(Math.abs(polyArea(hit.u.poly)))} m², ${hit.u.h} m tall`); }
       else if (hit.kind === 'building') placeTip(hit.ev, buildingTip(hit.b));
       else { S.sel = null; tip.hidden = true; }
     }
@@ -925,15 +1439,89 @@ void main(){
   });
   $('#hkwResetView').addEventListener('click', () => { if (view3d) view3d.resetView(); });
 
+  // 3D solver for the current site and quality (re-made only when the grid size changes)
+  async function prepare3d() {
+    if (!window.HKWSolver3D) return false;
+    if (s3Creating) { try { await s3Creating; } catch (e) { /* handled by its caller */ } }
+    const d = dims3(), key = `${d.nx}x${d.nz}`;
+    if (!s3 || s3.lost || s3Key !== key) {
+      if (s3) s3.dispose();
+      s3 = null; s3Key = ''; g3 = null;
+      const pref = ['webgpu', 'webgl2'].includes(params.get('engine')) ? params.get('engine') : 'auto';
+      s3Creating = HKWSolver3D.create({ nx: d.nx, ny: d.ny, nz: d.nz, prefer: pref, zref: ZREF_M / d.dx, alpha: ALPHA,
+        sponge: Math.max(4, Math.round(d.nx * 0.06)), tau0: 0.5 + 3 * NU3, cs2: CS3 * CS3, umax: 0.25 });
+      try { s3 = await s3Creating; } finally { s3Creating = null; }
+      if (!s3) { s3Failed = true; S.engineNote = '(This device has no WebGPU, and no WebGL2 with five float render targets, so it shows the 2D slice only.)'; return false; }
+      s3Key = key;
+    }
+    g3 = d;
+    return true;
+  }
+  function adapter3() {
+    return { kind: '3d', N: g3.nx, get lost() { return !s3 || s3.lost; }, init() {}, setMask() {}, step(n) { return s3.step(n); }, read() { return slice.buf; }, dispose() {} };
+  }
   function restartFlow() {
-    if (!solver) newSolver();
+    if (window.HKW_TRACE) console.log('[trace] restartFlow engine=' + S.engine + ' failed=' + s3Failed + ' ' + String(new Error().stack).split(String.fromCharCode(10)).slice(2, 6).map((l) => l.trim()).join(' | '));
+    const tok = ++flowToken;
+    field3 = null; parts3 = []; S.lineSegs = 0;
+    if (view3d) { view3d.setStreamlines(null); view3d.setSection(null); }
+    if (S.engine === '3d' && !s3Failed && window.HKWSolver3D && S.data && S.dirIdx !== null) {
+      S.preparing = true;
+      settleEl.textContent = 'Preparing the 3D wind 準備緊三維風場…'; settleEl.classList.remove('ok');
+      prepare3d().then((ok) => {
+        if (tok !== flowToken) return;
+        S.preparing = false;
+        if (!ok) { S.engine = '2d'; syncQualityLabels(); restartFlow(); return; }
+        solver = adapter3();
+        rebuildMask();
+        const u = inflow(S.dirIdx);
+        s3.setInflow(u[0] * UREF / U0, u[1] * UREF / U0); s3.init();
+        fillSlice(null);
+        const go = () => {
+          if (tok !== flowToken) return;
+          S.spf = Math.max(2, Math.min(60, Math.round(BATCH_MS / s3.msPerStep)));
+          busySkips = busyFrames = 0;
+          afterRestart();
+        };
+        if (s3.msPerStep) { go(); return; }
+        S.preparing = true;
+        const sCal = s3;
+        calibrate3d(sCal).then(() => { if (tok !== flowToken) return; S.preparing = false; sCal.init(); go(); })
+          .catch((e) => { if (tok !== flowToken) return; S.preparing = false; sCal.msPerStep = 10; console.info('[wind] calibration skipped:', e.message); go(); });
+      }).catch((e) => {
+        if (tok !== flowToken) return;
+        console.warn('[wind] 3D could not start:', e.message);
+        S.preparing = false; s3Failed = true; s3 = null; S.engine = '2d';
+        S.engineNote = '(3D could not start here, so this shows the 2D slice.)';
+        syncQualityLabels(); restartFlow();
+      });
+      return;
+    }
+    if (!solver || solver.kind === '3d') newSolver();
     rebuildMask();
     solver.init(inflow(S.dirIdx));
-    S.steps = 0; resetParticles(); drawBuildings(); updateWindText();
-    if (view3d) view3d.setWind(S.dirIdx);
-    if (!S.running && !S.idlePaused) { /* stay paused */ }
+    afterRestart();
   }
-  function restart() { S.field = null; newSolver(); restartFlow(); }
+  function afterRestart() {
+    S.steps = 0; stepsT = 0; S.field = null; resetParticles(); drawBuildings(); updateWindText();
+    if (S.showField && solver.kind === '3d') paintField(slice.buf);
+    engineEl.textContent = engineText();
+    $('#hkwQuality').disabled = solver.kind === 'cpu';
+    if (view3d) { view3d.setWind(S.dirIdx); if (S.showField) view3d.markField(); }
+    syncEngineUI();
+    updateStatus();
+  }
+  function syncEngineUI() {
+    const is3 = !!solver && solver.kind === '3d';
+    root.querySelectorAll('.hkw-only3d').forEach((el) => { el.hidden = !is3; });
+    syncQualityLabels();
+    stage.classList.toggle('engine3d', is3);
+  }
+  function restart() {
+    S.field = null;
+    if (S.engine === '3d' && !s3Failed) { restartFlow(); return; }
+    newSolver(); restartFlow();
+  }
   function setDir(i) { S.dirIdx = i; touch(); drawRose(); restartFlow(); }
   function updateWindText() {
     const [en, zh] = DIRS[S.dirIdx];
@@ -969,141 +1557,282 @@ void main(){
   }
 
   // ---------------------------------------------------------------- editing
+  // Drawing works like the HK landscape tool: click corner by corner; double-click, click the first
+  // corner, press Enter or right-click to finish; press and drag for a quick rectangle; Esc cancels.
+  // Snapping: corners of drawn buildings, right angles to the previous edge (Shift flips it), 1 m grid.
+  const SNAP = { grid: true, square: true };
+  const coarse = () => !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
   function toM(ev) {
     const r = cvBld.getBoundingClientRect();
-    return [(ev.clientX - r.left) / r.width * DOMAIN_M, (ev.clientY - r.top) / r.height * DOMAIN_M];
+    return [Math.min(DOMAIN_M, Math.max(0, (ev.clientX - r.left) / r.width * DOMAIN_M)), Math.min(DOMAIN_M, Math.max(0, (ev.clientY - r.top) / r.height * DOMAIN_M))];
   }
-  let drag = null, maskTimer = 0;
+  function toPx(ev) { const r = cvBld.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; }
+  const kPx = () => S.size / DOMAIN_M;                      // CSS pixels per metre
+  const rectPts = (a, b) => [[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]]];
+  const r1 = (v) => Math.round(v * 100) / 100;
+  let drag = null, maskTimer = 0, lastDown = null;
   function scheduleMask() {
     if (maskTimer) return;
     maskTimer = setTimeout(() => { maskTimer = 0; rebuildMask(); }, 90);
   }
+  function drawMsg(t) { const el = $('#hkwDrawMsg'); if (el) el.textContent = t || ''; }
   function syncSel() {
     const box = $('#hkwSel');
     if (!S.sel) { box.hidden = true; return; }
     box.hidden = false;
-    $('#hkwSelH').value = S.sel.h; $('#hkwSelW').value = S.sel.w; $('#hkwSelD').value = S.sel.d; $('#hkwSelR').value = S.sel.rot;
-    $('#hkwSelRv').textContent = S.sel.rot + '°';
+    $('#hkwSelH').value = S.sel.h;
+    const a = Math.abs(polyArea(S.sel.poly)), base = userBase(S.sel);
+    $('#hkwSelInfo').textContent = `${S.sel.poly.length} corners · ${Math.round(a).toLocaleString()} m² · stands on the ground at ${base.toFixed(1)} mPD, roof at ${(base + S.sel.h).toFixed(1)} mPD. 企喺地面 ${base.toFixed(1)} mPD。`;
   }
+  const MODE_HELP = {
+    look: 'Hover a building for its name and height. Click one of your orange buildings to select it: drag it to move, drag a white corner to reshape, drag a small circle on an edge to add a corner, right-click a corner to delete it. Delete removes the selected corner or building. 揀橙色樓：拖嚟搬，拉白角改形，拉邊上圓點加角。',
+    draw: 'Click corner by corner. Double-click, click the first corner or press Enter to finish; Esc cancels, Backspace takes back the last corner. Press and drag for a quick rectangle. Shift flips right-angle snapping. 逐點撳畫外形，雙擊或撳返第一點完成；按住拖可畫長方形。',
+    remove: 'Click an orange building to delete it, or an existing building to take it away (what if it was not there?). Click again to bring it back.',
+  };
   function setMode(m) {
+    if (m !== 'draw') S.draft = null;
     S.mode = m;
+    if (m !== 'look') S.selV = null;
     root.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('on', b.dataset.mode === m));
-    cvBld.style.cursor = m === 'add' ? 'crosshair' : (m === 'remove' ? 'not-allowed' : 'default');
-    $('#hkwModeHelp').textContent = {
-      look: 'Hover a building for its name and height, or a street for how windy it is here.',
-      add: 'Drag on an open space to draw a new block. Drag an orange block to move it. 拖曳畫新樓，拖橙色樓可以搬。',
-      remove: 'Click an orange block to delete it, or an existing building to take it away (what if it was not there?). Click again to bring it back.',
-    }[m];
+    cvBld.style.cursor = m === 'draw' ? 'crosshair' : (m === 'remove' ? 'not-allowed' : 'default');
+    $('#hkwModeHelp').textContent = MODE_HELP[m];
+    drawMsg('');
+    drawBuildings();
   }
+  const prevDirOf = (P) => (P.length >= 2 ? Math.atan2(P[P.length - 1][1] - P[P.length - 2][1], P[P.length - 1][0] - P[P.length - 2][0]) : null);
+  function snapPt(x, y, from, prevDir, ev, skip) {
+    const r = (handleR() + 3) / kPx();
+    for (const u of S.user) for (let i = 0; i < u.poly.length; i++) {
+      if (skip && skip.u === u && skip.i === i) continue;
+      const q = u.poly[i]; if (Math.hypot(q[0] - x, q[1] - y) < r) return { p: q.slice(), snapped: true };
+    }
+    const square = SNAP.square !== !!(ev && ev.shiftKey);
+    if (square && from) {
+      let a = Math.atan2(y - from[1], x - from[0]), L = Math.hypot(x - from[0], y - from[1]);
+      a = prevDir == null ? Math.round(a / (Math.PI / 12)) * (Math.PI / 12) : prevDir + Math.round((a - prevDir) / (Math.PI / 2)) * (Math.PI / 2);
+      if (SNAP.grid) L = Math.max(1, Math.round(L));
+      const d = [Math.cos(a), Math.sin(a)];
+      let p = [from[0] + d[0] * L, from[1] + d[1] * L], guide = null, snapped = false;
+      const D = S.draft;
+      if (D && D.pts.length >= 2) {   // stop where the edge lines up with the first corner, so the outline can close square
+        const f = D.pts[0], t = (f[0] - from[0]) * d[0] + (f[1] - from[1]) * d[1];
+        if (t > 1 && Math.abs(t - L) < r * 1.6) { p = [from[0] + d[0] * t, from[1] + d[1] * t]; guide = [p, f]; snapped = true; }
+      }
+      return { p: p.map(r1), snapped, guide };
+    }
+    if (SNAP.grid) return { p: [Math.round(x), Math.round(y)], snapped: false };
+    return { p: [r1(x), r1(y)], snapped: false };
+  }
+  function draftTip(ev) {
+    const D = S.draft; if (!D) { tip.hidden = true; return; }
+    let html;
+    if (D.rect) {
+      const a = D.pts[0], b = D.cur, w = Math.abs(b[0] - a[0]), d = Math.abs(b[1] - a[1]);
+      html = `${w.toFixed(0)} m x ${d.toFixed(0)} m · ${Math.round(w * d)} m²`;
+    } else {
+      const last = D.pts[D.pts.length - 1], L = Math.hypot(D.cur[0] - last[0], D.cur[1] - last[1]);
+      const pd = prevDirOf(D.pts);
+      let turn = '';
+      if (pd != null && L > 0.01) { let t = (Math.atan2(D.cur[1] - last[1], D.cur[0] - last[0]) - pd) * 180 / Math.PI; t = ((t + 540) % 360) - 180; turn = ` · turn ${Math.abs(t).toFixed(0)}°`; }
+      html = `Edge ${L.toFixed(1)} m${turn}` + (D.closeHint ? '<br><b>Click to finish 撳一下完成</b>' : '');
+    }
+    placeTip(ev, html);
+  }
+  function draftDown(ev, x, y, px, py) {
+    const now = performance.now(), D = S.draft;
+    if (!D) {
+      const p = SNAP.grid ? [Math.round(x), Math.round(y)] : [r1(x), r1(y)];
+      S.draft = { pts: [p], cur: p, down: [px, py], pressed: true, rect: false };
+      lastDown = { t: now, px, py }; drawMsg(''); return;
+    }
+    D.pressed = true;
+    const k = kPx(), f = D.pts[0];
+    const near1 = Math.hypot(f[0] * k - px, f[1] * k - py) < (coarse() ? 16 : 10);
+    const dbl = lastDown && now - lastDown.t < 380 && Math.hypot(lastDown.px - px, lastDown.py - py) < 6;
+    lastDown = { t: now, px, py };
+    if ((near1 || dbl) && D.pts.length >= 3) { finishDraft(); return; }
+    if (dbl) return;
+    const last = D.pts[D.pts.length - 1], s = snapPt(x, y, last, prevDirOf(D.pts), ev);
+    if (Math.hypot(s.p[0] - last[0], s.p[1] - last[1]) < 0.5) return;
+    D.pts.push(s.p); D.cur = s.p;
+  }
+  function draftMove(ev, x, y, px, py) {
+    const D = S.draft; if (!D) return;
+    if (D.pressed && D.pts.length === 1 && Math.hypot(px - D.down[0], py - D.down[1]) > 6) D.rect = true;
+    const last = D.pts[D.pts.length - 1];
+    const s = D.rect ? { p: SNAP.grid ? [Math.round(x), Math.round(y)] : [r1(x), r1(y)] } : snapPt(x, y, last, prevDirOf(D.pts), ev);
+    D.cur = s.p; D.snapped = !!s.snapped; D.guide = s.guide || null;
+    const f = D.pts[0], k = kPx();
+    D.closeHint = !D.rect && D.pts.length >= 3 && Math.hypot(f[0] * k - px, f[1] * k - py) < (coarse() ? 16 : 10);
+  }
+  function finishDraft() {
+    const D = S.draft; if (!D) return;
+    S.draft = null; tip.hidden = true;
+    let P = D.rect ? rectPts(D.pts[0], D.cur) : D.pts.map((p) => p.slice());
+    if (P.length < 3 || Math.abs(polyArea(P)) < 20) { drawMsg('Too small (under 20 m²), not added. 太細，冇加到。'); drawBuildings(); return; }
+    if (polySelfX(P)) { drawMsg('The edges cross. Draw it again. 邊交叉咗，請重畫。'); drawBuildings(); return; }
+    if (polyArea(P) < 0) P = P.reverse();
+    const u = { id: nextUserId++, poly: P, h: +$('#hkwNewH').value || 60 };
+    S.user.push(u); S.sel = u; S.selV = null;
+    setMode('look'); syncSel(); drawBuildings(); rebuildMask();
+    drawMsg(`Added a ${P.length}-corner building, ${Math.round(Math.abs(polyArea(P)))} m². Set its height below. 加咗一座 ${P.length} 角嘅樓，喺下面改高度。`);
+  }
+  function deleteVertex(u, i) {
+    if (!u || u.poly.length <= 3) { drawMsg('A building needs at least 3 corners. 最少要 3 個角。'); return; }
+    u.poly.splice(i, 1); S.selV = null; syncSel(); drawBuildings(); rebuildMask();
+  }
+  function deleteUser(u) { S.user = S.user.filter((v) => v !== u); if (S.sel === u) { S.sel = null; S.selV = null; } syncSel(); drawBuildings(); rebuildMask(); }
   cvBld.addEventListener('pointerdown', (ev) => {
-    const [x, y] = toM(ev);
-    if (S.mode === 'add') {
+    if (ev.button === 2) return;
+    const [x, y] = toM(ev), [px, py] = toPx(ev);
+    const capture = () => { try { cvBld.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic events */ } };
+    if (S.mode === 'draw') { draftDown(ev, x, y, px, py); capture(); ev.preventDefault(); drawBuildings(); draftTip(ev); return; }
+    if (S.mode === 'remove') {
       const u = hitUser(x, y);
-      if (u) { S.sel = u; drag = { kind: 'move', u, ox: x - u.cx, oy: y - u.cy }; }
-      else { drag = { kind: 'draw', x0: x, y0: y }; S.draft = { cx: x, cy: y, w: 1, d: 1, rot: 0, h: +$('#hkwNewH').value || 60 }; }
-      cvBld.setPointerCapture(ev.pointerId); syncSel(); drawBuildings();
-    } else if (S.mode === 'remove') {
-      const u = hitUser(x, y);
-      if (u) { S.user = S.user.filter((v) => v !== u); if (S.sel === u) S.sel = null; }
+      if (u) deleteUser(u);
       else {
         const b = hitBuilding(x, y);
         if (b) { if (S.removed.has(b.id)) S.removed.delete(b.id); else S.removed.add(b.id); }
+        syncSel(); drawBuildings(); rebuildMask();
       }
-      syncSel(); drawBuildings(); rebuildMask();
-    } else {
-      const u = hitUser(x, y); S.sel = u; syncSel(); drawBuildings();
+      return;
     }
+    const k = kPx(), R = ev.pointerType === 'touch' || coarse() ? 16 : 9;
+    if (S.sel) {
+      const P = S.sel.poly;
+      const vi = P.findIndex((q) => Math.hypot(q[0] * k - px, q[1] * k - py) < R);
+      if (vi >= 0) { S.selV = vi; drag = { kind: 'vertex', u: S.sel, i: vi, orig: P.map((p) => p.slice()) }; capture(); drawBuildings(); return; }
+      for (let i = 0; i < P.length; i++) {
+        const a = P[i], b = P[(i + 1) % P.length], mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+        if (Math.hypot((b[0] - a[0]) * k, (b[1] - a[1]) * k) >= 26 && Math.hypot(mx * k - px, my * k - py) < R) {
+          const orig = P.map((p) => p.slice());
+          P.splice(i + 1, 0, [r1(mx), r1(my)]); S.selV = i + 1;
+          drag = { kind: 'vertex', u: S.sel, i: i + 1, orig, moved: true }; capture(); drawBuildings(); return;
+        }
+      }
+    }
+    const u = hitUser(x, y);
+    if (u) { S.sel = u; S.selV = null; drag = { kind: 'move', u, x0: x, y0: y, orig: u.poly.map((p) => p.slice()) }; capture(); syncSel(); drawBuildings(); return; }
+    if (S.sel) { S.sel = null; S.selV = null; syncSel(); drawBuildings(); }
   });
   cvBld.addEventListener('pointermove', (ev) => {
-    const [x, y] = toM(ev);
-    if (drag && drag.kind === 'move') {
-      drag.u.cx = Math.min(DOMAIN_M, Math.max(0, x - drag.ox)); drag.u.cy = Math.min(DOMAIN_M, Math.max(0, y - drag.oy));
+    const [x, y] = toM(ev), [px, py] = toPx(ev);
+    if (S.mode === 'draw') { if (S.draft) { draftMove(ev, x, y, px, py); drawBuildings(); draftTip(ev); } else tip.hidden = true; return; }
+    if (drag && drag.kind === 'vertex') {
+      const P = drag.u.poly, n = P.length, s = snapPt(x, y, null, null, ev, { u: drag.u, i: drag.i });
+      P[drag.i] = s.p; drag.moved = true;
+      const prev = P[(drag.i + n - 1) % n];
+      placeTip(ev, `Corner ${drag.i + 1} · edge ${Math.hypot(s.p[0] - prev[0], s.p[1] - prev[1]).toFixed(1)} m`);
       drawBuildings(); scheduleMask(); return;
     }
-    if (drag && drag.kind === 'draw') {
-      const d = S.draft; d.cx = (drag.x0 + x) / 2; d.cy = (drag.y0 + y) / 2; d.w = Math.abs(x - drag.x0); d.d = Math.abs(y - drag.y0);
-      drawBuildings(); return;
+    if (drag && drag.kind === 'move') {
+      let dx = x - drag.x0, dy = y - drag.y0; if (SNAP.grid) { dx = Math.round(dx); dy = Math.round(dy); }
+      if (Math.abs(dx) + Math.abs(dy) > 0) drag.moved = true;
+      drag.u.poly = drag.orig.map(([a, b]) => [r1(a + dx), r1(b + dy)]);
+      drawBuildings(); scheduleMask(); return;
     }
     showTip(ev, x, y);
   });
   const endDrag = () => {
-    if (drag && drag.kind === 'draw') {
-      const d = S.draft; S.draft = null;
-      if (d.w >= 6 && d.d >= 6) {
-        const u = { id: nextUserId++, cx: Math.round(d.cx), cy: Math.round(d.cy), w: Math.round(d.w), d: Math.round(d.d), rot: 0, h: d.h };
-        S.user.push(u); S.sel = u; rebuildMask();
-      }
-      syncSel(); drawBuildings();
-    } else if (drag && drag.kind === 'move') { rebuildMask(); }
-    drag = null;
+    if (S.draft) { S.draft.pressed = false; if (S.draft.rect) finishDraft(); drawBuildings(); return; }
+    if (!drag) return;
+    if (drag.kind === 'vertex' && drag.moved && polySelfX(drag.u.poly)) { drag.u.poly = drag.orig; drawMsg('That would make the edges cross, so the corner went back. 邊會交叉，角已還原。'); }
+    if (drag.moved) { rebuildMask(); syncSel(); }
+    tip.hidden = true; drag = null; drawBuildings();
   };
   cvBld.addEventListener('pointerup', endDrag);
   cvBld.addEventListener('pointercancel', endDrag);
-  cvBld.addEventListener('pointerleave', () => { tip.hidden = true; });
+  cvBld.addEventListener('pointerleave', () => { if (!drag) tip.hidden = true; });
+  cvBld.addEventListener('dblclick', (ev) => ev.preventDefault());
+  cvBld.addEventListener('contextmenu', (ev) => {     // right-click: finish the outline, or delete the corner under the cursor
+    ev.preventDefault();
+    if (S.draft) { if (S.draft.pts.length >= 3) finishDraft(); drawBuildings(); return; }
+    if (S.sel) {
+      const [px, py] = toPx(ev), k = kPx();
+      const i = S.sel.poly.findIndex((q) => Math.hypot(q[0] * k - px, q[1] * k - py) < 10);
+      if (i >= 0) deleteVertex(S.sel, i);
+    }
+  });
+  document.addEventListener('keydown', (ev) => {
+    const tg = ev.target && ev.target.tagName;
+    if (tg === 'INPUT' || tg === 'TEXTAREA' || tg === 'SELECT') return;
+    if (S.draft) {
+      if (ev.key === 'Enter') { ev.preventDefault(); if (S.draft.pts.length >= 3) finishDraft(); else drawMsg('Place at least 3 corners. 最少 3 個角。'); }
+      else if (ev.key === 'Escape') { S.draft = null; tip.hidden = true; drawMsg('Cancelled. 取消咗。'); }
+      else if (ev.key === 'Backspace') { ev.preventDefault(); S.draft.pts.pop(); if (!S.draft.pts.length) S.draft = null; }
+      else return;
+      drawBuildings(); return;
+    }
+    if (S.sel && (ev.key === 'Delete' || ev.key === 'Backspace')) {
+      ev.preventDefault();
+      if (S.selV != null && S.sel.poly[S.selV]) deleteVertex(S.sel, S.selV); else deleteUser(S.sel);
+    } else if (S.sel && ev.key === 'Escape') { S.sel = null; S.selV = null; syncSel(); drawBuildings(); }
+  });
 
   function showTip(ev, x, y) {
     if (S.mode !== 'look' && S.mode !== 'remove') { tip.hidden = true; return; }
     let html = '';
     const u = hitUser(x, y);
     const b = u ? null : hitBuilding(x, y);
-    if (u) html = `<b>Your block 你加嘅樓</b><br>${u.w} m x ${u.d} m, ${u.h} m tall`;
-    else if (b) {
-      const nm = [b.name, b.name_zh].filter(Boolean).join(' ') || 'Unnamed block 未命名';
-      const st = S.removed.has(b.id) ? 'taken away in this sketch' : (blocks(b) ? 'blocks the 2 m slice' : (b.type === 'Open-sided Structure' ? 'open-sided, wind passes under' : 'under 2.5 m, ignored'));
-      html = `<b>${nm}</b><br>${b.type || 'Block'} · ${b.h} m tall${b.storeys ? `, ${b.storeys} storeys` : ''} · ${st}`;
-    } else if (solver && S.steps > 0) {
+    if (u) html = `<b>Your building 你加嘅樓</b><br>${Math.round(Math.abs(polyArea(u.poly)))} m², ${u.h} m tall`;
+    else if (b) html = buildingTip(b);
+    else if (solver && S.steps > 0 && solver.read()) {
       const v = sampleU(solver.read(), x, y);
       if (v) {
         const r = Math.hypot(v[0], v[1]) / U0;
         const w = r < 0.35 ? 'Calm 好靜' : r < 0.75 ? 'Calmer than the incoming wind 比來風弱' : r < 1.1 ? 'About the same as the incoming wind 同來風差唔多' : 'Faster than the incoming wind 比來風強';
-        html = `<b>${w}</b>${S.steps * U0 / solver.N < 1.5 ? '<br><span class="small">still settling</span>' : ''}`;
+        const settling = solver.kind === '3d' ? S.steps * UREF * 0.7 / solver.N < 1.5 : S.steps * U0 / solver.N < 1.5;
+        html = `<b>${w}</b>${settling ? '<br><span class="small">still settling</span>' : ''}<br><span class="small">ground ${groundAt(x, y).toFixed(0)} mPD</span>`;
       }
     }
     if (!html) { tip.hidden = true; return; }
-    tip.innerHTML = html; tip.hidden = false;
-    const r = stage.getBoundingClientRect();
-    let lx = ev.clientX - r.left + 14, ly = ev.clientY - r.top + 14;
-    if (lx > S.size - 220) lx = ev.clientX - r.left - 220;
-    if (ly > S.size - 60) ly = ev.clientY - r.top - 60;
-    tip.style.left = lx + 'px'; tip.style.top = ly + 'px';
+    placeTip(ev, html);
   }
 
   // ---------------------------------------------------------------- controls
   root.addEventListener('click', (ev) => {
-    const t = ev.target.closest('[data-area],[data-dir],[data-season],[data-mode]');
+    const t = ev.target.closest('[data-area],[data-dir],[data-season],[data-mode],[data-wengine]');
     if (!t || !root.contains(t)) return;
     if (t.dataset.area) selectArea(t.dataset.area);
     else if (t.dataset.dir !== undefined) setDir(+t.dataset.dir);
     else if (t.dataset.season) { S.season = t.dataset.season; drawRose(); updateWindText(); }
     else if (t.dataset.mode) setMode(t.dataset.mode);
+    else if (t.dataset.wengine === '3d' || t.dataset.wengine === '2d') { touch(); S.engine = t.dataset.wengine; if (S.engine === '3d') { s3Failed = false; S.engineNote = ''; } syncQualityLabels(); restartFlow(); }
   });
   runBtn.addEventListener('click', () => { S.running = !S.running; S.idlePaused = false; touch(); syncRun(); });
   $('#hkwReset').addEventListener('click', () => { touch(); restartFlow(); });
-  $('#hkwUndo').addEventListener('click', () => { S.user = []; S.removed = new Set(); S.sel = null; syncSel(); drawBuildings(); rebuildMask(); });
-  $('#hkwShowField').addEventListener('change', (e) => { S.showField = e.target.checked; cvField.style.visibility = S.showField ? '' : 'hidden'; if (view3d) view3d.showField(S.showField); });
+  $('#hkwUndo').addEventListener('click', () => { S.user = []; S.removed = new Set(); S.sel = null; S.selV = null; S.draft = null; syncSel(); drawBuildings(); rebuildMask(); });
+  $('#hkwShowField').addEventListener('change', (e) => { S.showField = e.target.checked; cvField.style.visibility = S.showField ? '' : 'hidden'; if (view3d) view3d.showField(S.showField); if (S.showField && solver && solver.kind === '3d' && slice.buf) paintField(slice.buf); });
   $('#hkwShowParticles').addEventListener('change', (e) => { S.showParticles = e.target.checked; });
+  $('#hkwShowLines').addEventListener('change', (e) => { S.showLines = e.target.checked; if (view3d) { if (S.showLines) traceLines(); else view3d.setStreamlines(null); } });
+  $('#hkwShowSection').addEventListener('change', (e) => { S.showSection = e.target.checked; $('#hkwSecOff').disabled = !S.showSection; paintSection(); });
+  $('#hkwSecOff').addEventListener('input', (e) => { S.sectionOff = +e.target.value; $('#hkwSecOffV').textContent = `${S.sectionOff > 0 ? '+' : ''}${S.sectionOff} m`; paintSection(); });
+  $('#hkwSnapGrid').addEventListener('change', (e) => { SNAP.grid = e.target.checked; });
+  $('#hkwSnapSquare').addEventListener('change', (e) => { SNAP.square = e.target.checked; });
   $('#hkwQuality').value = S.quality;
   $('#hkwQuality').addEventListener('change', (e) => { S.quality = e.target.value; restart(); });
-  const selInput = (id, key, after) => $(id).addEventListener('input', (e) => {
-    if (!S.sel) return; const v = +e.target.value; if (!isFinite(v)) return;
-    S.sel[key] = v; if (after) after(); drawBuildings(); scheduleMask();
+  $('#hkwSelH').addEventListener('input', (e) => {
+    if (!S.sel) return; const v = +e.target.value; if (!isFinite(v) || v < 1) return;
+    S.sel.h = Math.min(500, v); syncSel(); drawBuildings(); scheduleMask();
   });
-  selInput('#hkwSelH', 'h'); selInput('#hkwSelW', 'w'); selInput('#hkwSelD', 'd');
-  selInput('#hkwSelR', 'rot', () => { $('#hkwSelRv').textContent = S.sel.rot + '°'; });
-  $('#hkwSelDel').addEventListener('click', () => { S.user = S.user.filter((v) => v !== S.sel); S.sel = null; syncSel(); drawBuildings(); rebuildMask(); });
+  $('#hkwSelDel').addEventListener('click', () => { if (S.sel) deleteUser(S.sel); });
   window.addEventListener('resize', () => { resize(); resetParticles(); });
   new MutationObserver(() => { drawBuildings(); if (view3d) view3d.setTheme(isDark()); }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
-  // test hook: add a block programmatically (used by the automated check)
+  // test hooks (used by the automated check): add a rectangle (optionally rotated) or any outline
   window.HKW.addBlock = (cx, cy, w, d, h, rot) => {
-    const u = { id: nextUserId++, cx, cy, w, d, h: h || 60, rot: rot || 0 };
+    const a = (rot || 0) * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+    const poly = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([px, py]) => { const x = px * w / 2, y = py * d / 2; return [r1(cx + x * c - y * s), r1(cy + x * s + y * c)]; });
+    const u = { id: nextUserId++, poly, h: h || 60 };
     S.user.push(u); S.sel = u; syncSel(); drawBuildings(); rebuildMask(); return u.id;
   };
-  window.HKW.clearBlocks = () => { S.user = []; S.sel = null; syncSel(); drawBuildings(); rebuildMask(); };
-  window.HKW.selectSite = selectSite; window.HKW.selectArea = selectArea; window.HKW.setView = setView;
+  window.HKW.addPoly = (poly, h) => { const u = { id: nextUserId++, poly: poly.map((p) => p.slice()), h: h || 60 }; S.user.push(u); S.sel = u; syncSel(); drawBuildings(); rebuildMask(); return u.id; };
+  window.HKW.clearBlocks = () => { S.user = []; S.sel = null; S.selV = null; syncSel(); drawBuildings(); rebuildMask(); };
+  window.HKW.selectSite = selectSite; window.HKW.selectArea = selectArea; window.HKW.setView = setView; window.HKW.setDir = setDir;
+  window.HKW.setMode = setMode; window.HKW.paintSection = paintSection; window.HKW.traceLines = traceLines;
 
   // ---------------------------------------------------------------- start
-  setMode('look'); syncRun(); resize(); newSolver();
+  setMode('look'); syncRun(); resize(); newSolver(); syncQualityLabels();
   initMap();
   $('#hkwViewHelp').textContent = VIEW_HELP['2d'];
   const plat = parseFloat(params.get('lat')), plon = parseFloat(params.get('lon'));

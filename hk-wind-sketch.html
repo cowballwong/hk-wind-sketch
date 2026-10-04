@@ -14,19 +14,19 @@
     a{color:rgb(var(--mcb-accent))}
   </style>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-  <link rel="stylesheet" href="app/static/wind.css?v=2.0.0">
-  <meta name="description" content="Search any place in Hong Kong and sketch how wind moves between its buildings at street level, in plan or 3D. Teaching sketch, not an AVA.">
+  <link rel="stylesheet" href="app/static/wind.css?v=3.0.0-preview">
+  <meta name="description" content="Search any place in Hong Kong and sketch how wind moves over its terrain and around its buildings, with a 3D lattice Boltzmann model in the browser. Teaching sketch, not an AVA.">
 </head>
 <body>
   <main class=""><div class="hkw" id="hkw">
   <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 
   <header class="hkw-head">
-    <div class="hkw-kicker">HK Wind Sketch · 香港風環境草圖 · v2</div>
-    <h1>See how wind moves between buildings at street level</h1>
-    <p class="hkw-lede">Search any place in Hong Kong, or click the map. Your browser fetches the government's building footprints for a 600 m square there and runs a small wind simulation on a flat slice about 2 m above the ground. Pick a wind direction, draw a new block, and look at it in plan or in 3D.</p>
-    <p class="hkw-lede">搜尋香港任何地方，或者喺地圖撳一下。你部電腦會攞嗰度 600 米見方嘅政府建築物資料，即時計一個離地大約 2 米嘅風場切面。揀風向、加座新樓，可以睇平面或者 3D。</p>
-    <p class="hkw-warn">A qualitative 2D sketch for teaching and early design feel. Not an Air Ventilation Assessment (AVA) under HPLB/ETWB TC No. 1/06: no wind velocity ratio (VR) figures, no pass or fail. The 3D view shows the same 2D slice among the real building heights; it is not a 3D simulation. 只係教學同早期設計參考嘅二維草圖，唔係 AVA，冇 VR 數字，冇合格不合格。3D 只係將同一個二維切面放喺真實樓高之間顯示，唔係三維模擬。</p>
+    <div class="hkw-kicker">HK Wind Sketch · 香港風環境草圖 · v3 preview</div>
+    <h1>See how wind moves over and around buildings, in 3D</h1>
+    <p class="hkw-lede">Search any place in Hong Kong, or click the map. Your browser fetches the government's buildings and ground levels for a 600 m square there and runs a small 3D wind simulation on your graphics card: air comes in from the direction you pick, climbs the slopes, goes over the roofs and squeezes round the towers. Draw your own building outline and see what changes, in plan or in 3D.</p>
+    <p class="hkw-lede">搜尋香港任何地方，或者喺地圖撳一下。你部電腦會攞嗰度 600 米見方嘅政府建築物同地形資料，用顯示卡即時計一個三維風場：風由你揀嘅方向吹入，爬上山坡、越過屋頂、繞過高樓。可以自己畫樓嘅外形，睇平面或者 3D 有咩唔同。</p>
+    <p class="hkw-warn">A qualitative teaching sketch on a coarse grid (cells about 4 to 6 m), for early design feel. Not an Air Ventilation Assessment (AVA) under HPLB/ETWB TC No. 1/06: no wind velocity ratio (VR) figures, no pass or fail. The 3D speeds are approximate: the grid is coarse, the incoming wind profile is assumed, and the model has not been checked against a wind tunnel. 只係教學同早期設計參考嘅草圖，格網粗（每格約 4 至 6 米），唔係 AVA，冇 VR 數字，冇合格不合格；三維風速只係大概。</p>
   </header>
 
   <section class="hkw-site" aria-label="Site">
@@ -73,7 +73,7 @@
       <div class="hkw-legend">
         <div class="hkw-legendbar" id="hkwLegendBar"></div>
         <div class="hkw-legendlbl"><span>Calm 靜</span><span>Same as the incoming wind 同來風差唔多</span><span>Faster 加速</span></div>
-        <div class="small">Speed compared with the wind coming in at the edge. Qualitative colours only, no numbers. Plan: grey blocks, darker = taller; dashed outline = does not block the 2 m slice. 3D: white = existing, orange = yours, faint = does not block the slice, red dashes = taken away.</div>
+        <div class="small">Speed about 2 m above the ground, compared with the incoming wind at the same height over open ground. Qualitative colours only, no numbers. Streamlines: pale = slow, dark blue = fast. Plan: grey blocks, darker = taller; thin lines = 5 m ground contours; dashed outline = does not block the wind. 3D: white = existing, orange = yours, faint = does not block, red dashes = taken away; the vertical section cuts solids in charcoal.</div>
       </div>
       <div class="hkw-bar">
         <button type="button" class="hkw-btn" id="hkwRun">Pause 暫停</button>
@@ -102,34 +102,43 @@
       <section class="hkw-card">
         <div class="hkw-step">3 · Try a design 試吓設計</div>
         <div class="hkw-modes" role="group">
-          <button type="button" class="hkw-chip" data-mode="look">Look 睇</button>
-          <button type="button" class="hkw-chip" data-mode="add">Add block 加樓</button>
+          <button type="button" class="hkw-chip" data-mode="look">Look / edit 睇 · 改</button>
+          <button type="button" class="hkw-chip" data-mode="draw">Draw building 畫樓</button>
           <button type="button" class="hkw-chip" data-mode="remove">Remove 拆走</button>
         </div>
         <p class="small" id="hkwModeHelp"></p>
-        <label class="hkw-f">Height of new blocks 新樓高度 (m) <input type="number" id="hkwNewH" value="60" min="3" max="500" step="1"></label>
+        <div class="hkw-snaps">
+          <label class="hkw-check sm"><input type="checkbox" id="hkwSnapGrid" checked> 1 m grid 格</label>
+          <label class="hkw-check sm"><input type="checkbox" id="hkwSnapSquare" checked> Right angles 直角 <span class="small">(Shift flips)</span></label>
+        </div>
+        <label class="hkw-f">Height of new buildings 新樓高度 (m) <input type="number" id="hkwNewH" value="60" min="3" max="500" step="1"></label>
+        <p class="small hkw-drawmsg" id="hkwDrawMsg" aria-live="polite"></p>
         <div class="hkw-sel" id="hkwSel" hidden>
-          <div class="hkw-step">Selected block 揀咗嘅樓</div>
-          <div class="hkw-grid">
-            <label class="hkw-f">Width 闊 (m)<input type="number" id="hkwSelW" min="6" max="300" step="1"></label>
-            <label class="hkw-f">Depth 深 (m)<input type="number" id="hkwSelD" min="6" max="300" step="1"></label>
-            <label class="hkw-f">Height 高 (m)<input type="number" id="hkwSelH" min="3" max="500" step="1"></label>
-          </div>
-          <label class="hkw-f">Rotate 轉 <span id="hkwSelRv">0°</span><input type="range" id="hkwSelR" min="-90" max="90" step="1" value="0"></label>
-          <button type="button" class="hkw-btn" id="hkwSelDel">Delete block 刪除</button>
+          <div class="hkw-step">Selected building 揀咗嘅樓</div>
+          <label class="hkw-f">Height above its ground 高度 (m)<input type="number" id="hkwSelH" min="3" max="500" step="1"></label>
+          <p class="small" id="hkwSelInfo"></p>
+          <button type="button" class="hkw-btn" id="hkwSelDel">Delete building 刪除</button>
         </div>
         <button type="button" class="hkw-btn" id="hkwUndo">Undo all edits 還原</button>
       </section>
 
       <section class="hkw-card">
+        <div class="hkw-step">Wind model 風場模型</div>
+        <div class="hkw-modes" role="group" aria-label="Wind model">
+          <button type="button" class="hkw-chip sm" data-wengine="3d">3D 立體 (D3Q19)</button>
+          <button type="button" class="hkw-chip sm" data-wengine="2d">2D slice 平面切片</button>
+        </div>
         <div class="hkw-step">Display 顯示</div>
-        <label class="hkw-check"><input type="checkbox" id="hkwShowField" checked> Colour by wind speed 風速顏色</label>
-        <label class="hkw-check"><input type="checkbox" id="hkwShowParticles" checked> Moving streaks 氣流線</label>
+        <label class="hkw-check"><input type="checkbox" id="hkwShowField" checked> Ground colour = wind about 2 m up 地面風速顏色</label>
+        <label class="hkw-check"><input type="checkbox" id="hkwShowParticles" checked> Moving particles 流動粒子</label>
+        <label class="hkw-check hkw-only3d" hidden><input type="checkbox" id="hkwShowLines" checked> 3D streamlines 三維流線</label>
+        <label class="hkw-check hkw-only3d" hidden><input type="checkbox" id="hkwShowSection"> Vertical section along the wind 順風剖面</label>
+        <label class="hkw-f hkw-only3d" hidden>Section position 剖面位置 <span id="hkwSecOffV">0 m</span><input type="range" id="hkwSecOff" min="-260" max="260" step="10" value="0" disabled></label>
         <label class="hkw-f">Detail 精細度
           <select id="hkwQuality">
-            <option value="light">Light: 240 x 240 cells (2.5 m)</option>
-            <option value="normal">Normal: 300 x 300 cells (2 m)</option>
-            <option value="fine">Fine: 400 x 400 cells (1.5 m)</option>
+            <option value="light">Light</option>
+            <option value="normal">Normal</option>
+            <option value="fine">Fine</option>
           </select>
         </label>
         <button type="button" class="hkw-link" id="hkwResetView" hidden>Reset 3D camera 重設視角</button>
@@ -141,40 +150,41 @@
     <div>
       <h3>How to read it 點樣睇</h3>
       <ul>
-        <li><b>Wind corridors 風道:</b> long yellow or orange bands along streets that line up with the wind.</li>
-        <li><b>Calm zones 靜風區:</b> dark blue patches behind blocks (the wake) and inside courtyards.</li>
-        <li><b>Corner acceleration 轉角加速:</b> orange or red spots where the wind squeezes round a corner.</li>
-        <li>White streaks follow the air. Eddies keep moving after the pattern settles; real wind is unsteady too.</li>
-        <li>Compare, don't measure: change one thing (a block, a gap, a direction) and look at what changes.</li>
+        <li><b>Wind corridors 風道:</b> long dark-blue bands along streets that line up with the wind.</li>
+        <li><b>Calm zones 靜風區:</b> pale patches behind blocks (the wake), in courtyards and in hollows.</li>
+        <li><b>Corner acceleration 轉角加速:</b> the darkest spots, where the wind squeezes round a corner or comes down the face of a tall tower.</li>
+        <li><b>Over and around 越過同繞過:</b> in 3D, follow a streamline: low ones bend round the towers, higher ones lift over the roofs and drop behind them.</li>
+        <li>Compare, don't measure: change one thing (a building, a gap, a direction) and look at what changes.</li>
       </ul>
     </div>
     <div>
-      <h3>What height does here 高度有咩用</h3>
-      <p>The simulation is one flat slice about 2 m above the ground. A block either stands in that slice or it doesn't, so for the wind, height decides only one thing: a block at least 2.5 m tall from its own base blocks the slice. A 10-storey and a 60-storey tower look the same to this sketch.</p>
-      <p>The 3D view draws every block at its real height (LandsD top minus base level) so you can see the street section, but the coloured layer is still the 2D slice. Ground is flattened: blocks on a slope all stand on one level. In real streets tall towers also drag faster air down to the pavement (downwash), and wind comes over roofs as well as round the sides. A 2D slice shows neither. 3D 視圖用真實樓高，但風場仍然係二維切面；地形攤平咗；睇唔到高樓將高空風帶落地面。</p>
+      <h3>Ground and height 地形同高度</h3>
+      <p>The ground is LandsD's 5 m terrain model, so slopes such as the Mid-Levels are real, and the wind has to climb them. Each building stands on its own LandsD base level and rises to its LandsD top level, so towers on a slope keep their true roof heights. In the 3D model the air goes over roofs as well as round the sides, and tall towers can drag faster air down to the street.</p>
+      <p>The solid shapes are kept simple: each ground spot is solid from the terrain up to the tallest roof standing on it, so open ground floors, footbridges, covered walkways and trees are not there. The terrain model itself includes elevated roads and tree canopy, which become solid ground here. 地形用地政總署 5 米地形模型；每座樓企喺自己嘅地面水平，樓頂高度係真；高架路同樹冠喺地形模型入面，會當實心。</p>
     </div>
     <div>
       <h3>What this is not 呢個唔係乜</h3>
       <ul>
-        <li>Not an AVA and not the TC No. 1/06 method, which needs 3D, wind directions weighted by how often they blow, VR at test points, and usually a wind tunnel for a Detailed Study.</li>
-        <li>No wind speeds, no VR, no comfort or safety rating, no pass or fail.</li>
+        <li>Not an AVA and not the TC No. 1/06 method, which needs wind directions weighted by how often they blow, VR at agreed test points, and usually a wind tunnel for a Detailed Study.</li>
+        <li>No wind speeds, no VR, no comfort or safety rating, no pass or fail. The 3D speeds are approximate.</li>
         <li>Nothing about wind loads on buildings (that is the Code of Practice on Wind Effects in Hong Kong 2019, for structural engineers).</li>
-        <li>2D only: no terrain, trees, footbridges or covered walkways; open ground floors are not known; cells are about 2 m; the incoming wind is uniform and made up.</li>
+        <li>Coarse: cells are about 4.7 m at Normal, so narrow lanes and small gaps close up; the incoming wind profile is assumed; the edges of the square are pulled towards the incoming wind; the lid of the model is about 250 to 300 m up, and anything taller is cut off there.</li>
       </ul>
     </div>
     <div>
       <h3>How it works 原理</h3>
-      <p>The 600 m square is split into a grid of cells (300 x 300 at Normal). Each cell holds nine numbers: how much air is moving in each of nine directions. Every step the air hops to the next cell and the nine numbers relax towards a balanced mix; air that hits a wall bounces back. This is the lattice Boltzmann method (D2Q9, with a Smagorinsky turbulence model). Thousands of steps later, the street pattern appears. It runs on your own computer. When you pick a site, your browser asks the government's open-data services directly for the buildings and the wind table; nothing you draw is uploaded.</p>
+      <p>The 600 m square and the air above it are split into a 3D grid of cells (128 x 128 across at Normal, and as many layers as the buildings need). Each cell holds nineteen numbers: how much air is moving in each of nineteen directions. Every step the air hops to the next cell and the numbers relax towards a balanced mix; air that hits the ground or a wall bounces back; the top is a slippery lid. This is the lattice Boltzmann method (D3Q19, regularised BGK with a Smagorinsky turbulence model), run as WebGPU compute shaders, or as WebGL2 shaders where WebGPU is missing or would wake a laptop's big graphics card. The wind enters from your direction with a speed that grows with height (a power law reaching the reference speed at PlanD's 200 m level). Where the graphics card cannot do 3D, the page runs the v2 sketch instead, one flat slice about 2 m up, and says so under the picture. Nothing you draw is uploaded.</p>
     </div>
   </section>
 
   <footer class="hkw-credits">
-    <b>Data 數據來源.</b> Building footprints and heights: Lands Department, HKSAR Government, Building dataset (CSDI Portal / DATA.GOV.HK), fetched live from the CSDI web feature service for the square you pick (the four ready-made areas were fetched October 2026). Wind direction frequencies: Planning Department, HKSAR Government, Site Wind Availability Data (simulated, 500 m grid, 200 m level), fetched live from pland.gov.hk. Base map and place search: Map from Lands Department (map.gov.hk location search). Address search: Address Lookup Service (ALS), HKSAR Government. Used under the DATA.GOV.HK and CSDI terms; the data is provided as is, with no warranty from the Government, and may not show recent changes. Software: three.js (MIT), Leaflet (BSD-2-Clause). Simulation code: HK Wind Sketch, open source (MIT). Not official. Not professional advice.
+    <b>Data 數據來源.</b> Building footprints and heights: Lands Department, HKSAR Government, Building dataset (CSDI Portal / DATA.GOV.HK), fetched live from the CSDI web feature service for the square you pick (the four ready-made areas were fetched October 2026). Ground levels: Lands Department, HKSAR Government, Digital Terrain Model 5 m grid (DATA.GOV.HK / CSDI Portal), derived from the December 2015 DOP5000 release, about +/-5 m, cut into 1 km tiles kept with this page. Wind direction frequencies: Planning Department, HKSAR Government, Site Wind Availability Data (simulated, 500 m grid, 200 m level), fetched live from pland.gov.hk. Base map and place search: Map from Lands Department (map.gov.hk location search). Address search: Address Lookup Service (ALS), HKSAR Government. Used under the DATA.GOV.HK and CSDI terms; the data is provided as is, with no warranty from the Government, and may not show recent changes. Software: three.js (MIT), Leaflet (BSD-2-Clause). Simulation code: HK Wind Sketch, open source (MIT). Not official. Not professional advice.
   </footer>
 </div>
 
-<script>window.HKW_STATIC = 'app/static/'; window.HKW_VER = '2.0.0';</script>
+<script>window.HKW_STATIC = 'app/static/'; window.HKW_VER = '3.0.0-preview';</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
-<script src="app/static/wind.js?v=2.0.0"></script></main>
+<script src="app/static/solver3d.js?v=3.0.0-preview"></script>
+<script src="app/static/wind.js?v=3.0.0-preview"></script></main>
 </body>
 </html>
