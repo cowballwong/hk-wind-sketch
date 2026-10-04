@@ -1,36 +1,59 @@
 <div class="hkw" id="hkw">
+  <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 
   <header class="hkw-head">
-    <div class="hkw-kicker">HK Wind Sketch · 香港風環境草圖</div>
+    <div class="hkw-kicker">HK Wind Sketch · 香港風環境草圖 · v2</div>
     <h1>See how wind moves between buildings at street level</h1>
-    <p class="hkw-lede">Pick an area of Hong Kong and a wind direction. Your browser runs a small wind simulation on a flat slice about 2 m above the ground, through the government's building footprints. Draw a new block and watch the street wind change.</p>
-    <p class="hkw-lede">揀一個地區同風向，你部電腦會即時計一個離地大約 2 米嘅風場切面。加一座新樓，睇下條街嘅風點變。</p>
-    <p class="hkw-warn">A qualitative 2D sketch for teaching and early design feel. Not an Air Ventilation Assessment (AVA) under HPLB/ETWB TC No. 1/06: no wind velocity ratio (VR) figures, no pass or fail. 只係教學同早期設計參考嘅二維草圖，唔係 AVA，冇 VR 數字，冇合格不合格。</p>
+    <p class="hkw-lede">Search any place in Hong Kong, or click the map. Your browser fetches the government's building footprints for a 600 m square there and runs a small wind simulation on a flat slice about 2 m above the ground. Pick a wind direction, draw a new block, and look at it in plan or in 3D.</p>
+    <p class="hkw-lede">搜尋香港任何地方，或者喺地圖撳一下。你部電腦會攞嗰度 600 米見方嘅政府建築物資料，即時計一個離地大約 2 米嘅風場切面。揀風向、加座新樓，可以睇平面或者 3D。</p>
+    <p class="hkw-warn">A qualitative 2D sketch for teaching and early design feel. Not an Air Ventilation Assessment (AVA) under HPLB/ETWB TC No. 1/06: no wind velocity ratio (VR) figures, no pass or fail. The 3D view shows the same 2D slice among the real building heights; it is not a 3D simulation. 只係教學同早期設計參考嘅二維草圖，唔係 AVA，冇 VR 數字，冇合格不合格。3D 只係將同一個二維切面放喺真實樓高之間顯示，唔係三維模擬。</p>
   </header>
 
-  <div class="hkw-areas" role="group" aria-label="Area">
-    <span class="hkw-step">1 · Area 地區</span>
-    <button type="button" class="hkw-chip" data-area="kwun_tong">Kwun Tong 觀塘</button>
-    <button type="button" class="hkw-chip" data-area="central">Central 中環</button>
-    <button type="button" class="hkw-chip" data-area="mong_kok">Mong Kok 旺角</button>
-    <button type="button" class="hkw-chip" data-area="tsuen_wan">Tsuen Wan 荃灣</button>
-  </div>
-  <p class="hkw-areanote" id="hkwAreaNote"></p>
+  <section class="hkw-site" aria-label="Site">
+    <div class="hkw-sitectl">
+      <div class="hkw-step">1 · Site 地盤</div>
+      <div class="hkw-search">
+        <input id="hkwQ" type="search" autocomplete="off" spellcheck="false" enterkeyhint="search"
+               placeholder="Search a place or address 搜尋地方或地址" aria-label="Search a place or address"
+               role="combobox" aria-expanded="false" aria-controls="hkwSugg" aria-autocomplete="list">
+        <ul id="hkwSugg" class="hkw-sugg" role="listbox" hidden></ul>
+      </div>
+      <p class="small hkw-searchhint">e.g. Tai Koo Shing 太古城 · Sha Tin 沙田 · 1 Science Park West Avenue. Or click the map to drop the 600 m square anywhere. 或者喺地圖撳一下。</p>
+      <div class="hkw-step hkw-step2">Ready-made areas 現成地區</div>
+      <div class="hkw-areas" role="group" aria-label="Ready-made areas">
+        <button type="button" class="hkw-chip" data-area="kwun_tong">Kwun Tong 觀塘</button>
+        <button type="button" class="hkw-chip" data-area="central">Central 中環</button>
+        <button type="button" class="hkw-chip" data-area="mong_kok">Mong Kok 旺角</button>
+        <button type="button" class="hkw-chip" data-area="tsuen_wan">Tsuen Wan 荃灣</button>
+      </div>
+    </div>
+    <div class="hkw-mapwrap">
+      <div class="hkw-map" id="hkwMap" aria-label="Map: click to choose a site"></div>
+    </div>
+  </section>
+  <p class="hkw-areanote" id="hkwAreaNote" aria-live="polite"></p>
 
   <div class="hkw-main">
     <div class="hkw-stagewrap">
+      <div class="hkw-viewbar" role="group" aria-label="View">
+        <button type="button" class="hkw-seg on" data-view="2d">Plan 平面</button>
+        <button type="button" class="hkw-seg" data-view="3d">3D 立體</button>
+        <span class="small" id="hkwViewHelp"></span>
+      </div>
       <div class="hkw-stage" id="hkwStage">
         <canvas id="hkwField" class="hkw-field"></canvas>
         <canvas id="hkwTrail"></canvas>
         <canvas id="hkwBld"></canvas>
-        <div class="hkw-north" aria-hidden="true"><span>N</span>&#9650;</div>
+        <div class="hkw-3d" id="hkw3d" hidden></div>
+        <div class="hkw-north" id="hkwNorth" aria-hidden="true"><span>N</span>&#9650;</div>
         <div class="hkw-scale" aria-hidden="true"><i></i><span>100 m</span></div>
+        <div class="hkw-loading" id="hkwLoading" hidden></div>
         <div class="hkw-tip" id="hkwTip" hidden></div>
       </div>
       <div class="hkw-legend">
         <div class="hkw-legendbar" id="hkwLegendBar"></div>
         <div class="hkw-legendlbl"><span>Calm 靜</span><span>Same as the incoming wind 同來風差唔多</span><span>Faster 加速</span></div>
-        <div class="small">Speed compared with the wind coming in at the edge. Qualitative colours only, no numbers. Grey blocks: darker = taller. Dashed outline: does not block the 2 m slice.</div>
+        <div class="small">Speed compared with the wind coming in at the edge. Qualitative colours only, no numbers. Plan: grey blocks, darker = taller; dashed outline = does not block the 2 m slice. 3D: white = existing, orange = yours, faint = does not block the slice, red dashes = taken away.</div>
       </div>
       <div class="hkw-bar">
         <button type="button" class="hkw-btn" id="hkwRun">Pause 暫停</button>
@@ -53,7 +76,7 @@
         <svg id="hkwRose" class="hkw-rose" viewBox="0 0 220 220" role="img" aria-label="Wind direction picker"></svg>
         <p class="hkw-windtext" id="hkwWindText"></p>
         <p class="small" id="hkwTops"></p>
-        <p class="small">Petal length = how often the wind comes from that direction here, from PlanD's Site Wind Availability Data. Click a petal to pick it. The simulated wind has the same strength for every direction.</p>
+        <p class="small">Petal length = how often the wind comes from that direction here, from PlanD's Site Wind Availability Data for the 500 m grid cell at the centre of the square. Click a petal to pick it. The simulated wind has the same strength for every direction.</p>
       </section>
 
       <section class="hkw-card">
@@ -89,6 +112,7 @@
             <option value="fine">Fine: 400 x 400 cells (1.5 m)</option>
           </select>
         </label>
+        <button type="button" class="hkw-link" id="hkwResetView" hidden>Reset 3D camera 重設視角</button>
       </section>
     </aside>
   </div>
@@ -106,8 +130,8 @@
     </div>
     <div>
       <h3>What height does here 高度有咩用</h3>
-      <p>The simulation is one flat slice about 2 m above the ground. A block either stands in that slice or it doesn't, so height decides only one thing: a block at least 2.5 m tall from its own base blocks the slice. A 10-storey and a 60-storey tower look the same to this sketch.</p>
-      <p>In real streets tall towers also drag faster air down to the pavement (downwash), and wind comes over roofs as well as round the sides. A 2D slice shows neither. 二維切面睇唔到高樓將高空風帶落地面，亦睇唔到風由屋頂吹過。</p>
+      <p>The simulation is one flat slice about 2 m above the ground. A block either stands in that slice or it doesn't, so for the wind, height decides only one thing: a block at least 2.5 m tall from its own base blocks the slice. A 10-storey and a 60-storey tower look the same to this sketch.</p>
+      <p>The 3D view draws every block at its real height (LandsD top minus base level) so you can see the street section, but the coloured layer is still the 2D slice. Ground is flattened: blocks on a slope all stand on one level. In real streets tall towers also drag faster air down to the pavement (downwash), and wind comes over roofs as well as round the sides. A 2D slice shows neither. 3D 視圖用真實樓高，但風場仍然係二維切面；地形攤平咗；睇唔到高樓將高空風帶落地面。</p>
     </div>
     <div>
       <h3>What this is not 呢個唔係乜</h3>
@@ -120,11 +144,11 @@
     </div>
     <div>
       <h3>How it works 原理</h3>
-      <p>The 600 m square is split into a grid of cells (300 x 300 at Normal). Each cell holds nine numbers: how much air is moving in each of nine directions. Every step the air hops to the next cell and the nine numbers relax towards a balanced mix; air that hits a wall bounces back. This is the lattice Boltzmann method (D2Q9, with a Smagorinsky turbulence model). Thousands of steps later, the street pattern appears. It runs on your own computer: nothing is uploaded.</p>
+      <p>The 600 m square is split into a grid of cells (300 x 300 at Normal). Each cell holds nine numbers: how much air is moving in each of nine directions. Every step the air hops to the next cell and the nine numbers relax towards a balanced mix; air that hits a wall bounces back. This is the lattice Boltzmann method (D2Q9, with a Smagorinsky turbulence model). Thousands of steps later, the street pattern appears. It runs on your own computer. When you pick a site, your browser asks the government's open-data services directly for the buildings and the wind table; nothing you draw is uploaded.</p>
     </div>
   </section>
 
   <footer class="hkw-credits">
-    <b>Data 數據來源.</b> Building footprints and heights: Lands Department, HKSAR Government, Building dataset (CSDI Portal / DATA.GOV.HK). Wind direction frequencies: Planning Department, HKSAR Government, Site Wind Availability Data (simulated, 500 m grid, 200 m level). Used under the DATA.GOV.HK Terms and Conditions; the data is provided as is, with no warranty from the Government. Footprints fetched October 2026 and may not show recent changes. Simulation code: HK Wind Sketch, open source (MIT). Not official. Not professional advice.
+    <b>Data 數據來源.</b> Building footprints and heights: Lands Department, HKSAR Government, Building dataset (CSDI Portal / DATA.GOV.HK), fetched live from the CSDI web feature service for the square you pick (the four ready-made areas were fetched October 2026). Wind direction frequencies: Planning Department, HKSAR Government, Site Wind Availability Data (simulated, 500 m grid, 200 m level), fetched live from pland.gov.hk. Base map and place search: Map from Lands Department (map.gov.hk location search). Address search: Address Lookup Service (ALS), HKSAR Government. Used under the DATA.GOV.HK and CSDI terms; the data is provided as is, with no warranty from the Government, and may not show recent changes. Software: three.js (MIT), Leaflet (BSD-2-Clause). Simulation code: HK Wind Sketch, open source (MIT). Not official. Not professional advice.
   </footer>
 </div>

@@ -39,6 +39,48 @@
   const WT = [4 / 9, 1 / 9, 1 / 9, 1 / 9, 1 / 9, 1 / 36, 1 / 36, 1 / 36, 1 / 36];
   const OPP = [0, 3, 4, 1, 2, 7, 8, 5, 6];
 
+  // live open data (all answer cross-origin requests, no key)
+  const WFS = 'https://portal.csdi.gov.hk/server/services/common/landsd_rcd_1637211194312_35158/MapServer/WFSServer';
+  const PLACE_SEARCH = 'https://www.map.gov.hk/gs/api/v1.0.0/locationSearch?q=';
+  const ALS = 'https://www.als.gov.hk/lookup?n=5&q=';
+  const STATIC = window.HKW_STATIC || 'app/static/';
+  const DATA_URL = window.HKW_DATA_URL || (STATIC + 'data/');
+  const HK_BOUNDS = [22.13, 113.82, 22.58, 114.45];     // lat0, lon0, lat1, lon1
+  const FETCH_PAD_M = 20;
+  const M_PER_DEG_LAT = 110574;
+  const mPerDegLon = (lat) => 111320 * Math.cos(lat * Math.PI / 180);
+
+  // HK1980 Grid (EPSG:2326) <-> WGS84. Transverse Mercator on the International 1924
+  // ellipsoid plus LandsD's published approximate datum shift (lat -5.5", lon +8.8");
+  // good to about 1-2 m, plenty for 500 m wind cells and a 600 m square.
+  const HK80 = (() => {
+    const a = 6378388, f = 1 / 297, e2 = 2 * f - f * f, ep2 = e2 / (1 - e2), e4 = e2 * e2, e6 = e4 * e2, Dg = Math.PI / 180;
+    const lat0 = (22 + 18 / 60 + 43.68 / 3600) * Dg, lon0 = (114 + 10 / 60 + 42.80 / 3600) * Dg, FE = 836694.05, FN = 819069.80;
+    const M = (p) => a * ((1 - e2 / 4 - 3 * e4 / 64 - 5 * e6 / 256) * p - (3 * e2 / 8 + 3 * e4 / 32 + 45 * e6 / 1024) * Math.sin(2 * p)
+      + (15 * e4 / 256 + 45 * e6 / 1024) * Math.sin(4 * p) - (35 * e6 / 3072) * Math.sin(6 * p));
+    const M0 = M(lat0), SLAT = 5.5 / 3600, SLON = 8.8 / 3600;
+    return {
+      toGrid(latW, lonW) {
+        const p = (latW + SLAT) * Dg, l = (lonW - SLON) * Dg, s = Math.sin(p), c = Math.cos(p), t = Math.tan(p);
+        const N = a / Math.sqrt(1 - e2 * s * s), T = t * t, C = ep2 * c * c, A = (l - lon0) * c;
+        const x = N * (A + (1 - T + C) * A ** 3 / 6 + (5 - 18 * T + T * T + 72 * C - 58 * ep2) * A ** 5 / 120);
+        const y = M(p) - M0 + N * t * (A * A / 2 + (5 - T + 9 * C + 4 * C * C) * A ** 4 / 24 + (61 - 58 * T + T * T + 600 * C - 330 * ep2) * A ** 6 / 720);
+        return [FE + x, FN + y];
+      },
+      toWGS(E, Nn) {
+        const mu = (M0 + Nn - FN) / (a * (1 - e2 / 4 - 3 * e4 / 64 - 5 * e6 / 256));
+        const e1 = (1 - Math.sqrt(1 - e2)) / (1 + Math.sqrt(1 - e2));
+        const p1 = mu + (3 * e1 / 2 - 27 * e1 ** 3 / 32) * Math.sin(2 * mu) + (21 * e1 * e1 / 16 - 55 * e1 ** 4 / 32) * Math.sin(4 * mu)
+          + (151 * e1 ** 3 / 96) * Math.sin(6 * mu) + (1097 * e1 ** 4 / 512) * Math.sin(8 * mu);
+        const s = Math.sin(p1), c = Math.cos(p1), t = Math.tan(p1);
+        const C1 = ep2 * c * c, T1 = t * t, N1 = a / Math.sqrt(1 - e2 * s * s), R1 = a * (1 - e2) / Math.pow(1 - e2 * s * s, 1.5), d = (E - FE) / N1;
+        const p = p1 - (N1 * t / R1) * (d * d / 2 - (5 + 3 * T1 + 10 * C1 - 4 * C1 * C1 - 9 * ep2) * d ** 4 / 24 + (61 + 90 * T1 + 298 * C1 + 45 * T1 * T1 - 252 * ep2 - 3 * C1 * C1) * d ** 6 / 720);
+        const l = lon0 + (d - (1 + 2 * T1 + C1) * d ** 3 / 6 + (5 - 2 * C1 + 28 * T1 - 3 * C1 * C1 + 8 * ep2 + 24 * T1 * T1) * d ** 5 / 120) / c;
+        return [p / Dg - SLAT, l / Dg + SLON];
+      },
+    };
+  })();
+
   // Wind FROM bearing b (deg clockwise from north) blows towards b+180.
   function inflow(dirIdx) {
     const b = dirIdx * 22.5 * Math.PI / 180;
@@ -276,13 +318,15 @@ void main(){
   const runBtn = $('#hkwRun'), pauseNote = $('#hkwPauseNote');
 
   const S = {
-    data: null, areaId: params.get('area') || 'kwun_tong', dirIdx: null, season: 'annual',
+    data: null, areaId: params.get('lat') ? null : (params.get('area') || 'kwun_tong'), dirIdx: null, season: 'annual',
+    view: '2d', loading: false, siteLabel: '',
     quality: params.get('quality') || 'normal', running: true, idlePaused: false,
     showField: true, showParticles: true, mode: 'look', user: [], removed: new Set(), sel: null,
     steps: 0, lastTouch: performance.now(), spf: 20, size: 600, dpr: 1, field: null, fps: 0,
   };
   let solver = null, maskArr = null, particles = [], buildings = [], nextUserId = 1;
-  window.HKW = { state: S, get solver() { return solver; } };   // for tests and the curious
+  let view3d = null, view3dLoading = null, need3d = { site: true, user: true };
+  window.HKW = { state: S, get solver() { return solver; }, get view3d() { return view3d; }, HK80 };   // for tests and the curious
 
   function forceCPU() { return params.get('engine') === 'cpu'; }
 
@@ -323,6 +367,7 @@ void main(){
     for (const b of buildings) if (blocks(b) && !S.removed.has(b.id)) for (const r of b.rings) pathRing(c, r, k);
     for (const u of S.user) pathRing(c, userPoly(u), k);
     c.fill('nonzero');
+    need3d.user = true;
     const px = c.getImageData(0, 0, N, N).data;
     maskArr = new Uint8Array(N * N);
     for (let i = 0; i < N * N; i++) maskArr[i] = px[i * 4 + 3] >= 128 ? 1 : 0;
@@ -353,6 +398,7 @@ void main(){
     S.dpr = Math.min(window.devicePixelRatio || 1, 2);
     stage.style.width = stage.style.height = S.size + 'px';
     for (const cv of [cvTrail, cvBld]) { cv.width = cv.height = Math.round(S.size * S.dpr); }
+    if (view3d) view3d.resize(S.size, S.size);
     drawBuildings();
   }
   function heightTone(h, dark) {
@@ -366,6 +412,7 @@ void main(){
     return window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches;
   }
   function drawBuildings() {
+    need3d.user = true;
     const c = ctxB, k = S.size * S.dpr / DOMAIN_M, dark = isDark();
     c.setTransform(1, 0, 0, 1, 0, 0);
     c.clearRect(0, 0, cvBld.width, cvBld.height);
@@ -427,9 +474,9 @@ void main(){
     for (let tries = 0; tries < 20; tries++) {
       const x = Math.random() * DOMAIN_M, y = Math.random() * DOMAIN_M;
       const N = solver.N, cx = Math.floor(x / DOMAIN_M * N), cy = Math.floor(y / DOMAIN_M * N);
-      if (!maskArr || !maskArr[cy * N + cx]) { p.x = x; p.y = y; p.age = Math.floor(Math.random() * 80); return p; }
+      if (!maskArr || !maskArr[cy * N + cx]) { p.x = x; p.y = y; p.age = Math.floor(Math.random() * 80); p.fresh = true; return p; }
     }
-    p.x = Math.random() * DOMAIN_M; p.y = Math.random() * DOMAIN_M; p.age = 0; return p;
+    p.x = Math.random() * DOMAIN_M; p.y = Math.random() * DOMAIN_M; p.age = 0; p.fresh = true; return p;
   }
   function resetParticles() {
     const n = solver.kind === 'gpu' ? 2600 : 1400;
@@ -442,7 +489,8 @@ void main(){
     c.globalCompositeOperation = 'destination-out';
     c.fillStyle = 'rgba(0,0,0,0.10)'; c.fillRect(0, 0, cvTrail.width, cvTrail.height);
     c.globalCompositeOperation = 'source-over';
-    if (!S.showParticles) return;
+    if (!S.showParticles && S.view !== '3d') return;
+    const draw2d = S.view === '2d';
     c.strokeStyle = S.showField ? 'rgba(255,255,255,0.78)' : (isDark() ? 'rgba(235,232,225,.8)' : 'rgba(30,30,30,.7)');
     c.lineWidth = 1.1 * S.dpr; c.beginPath();
     const gain = steps * dx * 0.55;
@@ -452,35 +500,37 @@ void main(){
       if (!u || p.age > 140) { seedParticle(p); p.age = 0; continue; }
       const nx = p.x + u[0] * gain, ny = p.y + u[1] * gain;
       if (nx < 0 || ny < 0 || nx >= DOMAIN_M || ny >= DOMAIN_M) { seedParticle(p); p.age = 0; continue; }
-      c.moveTo(p.x * k, p.y * k); c.lineTo(nx * k, ny * k);
+      if (draw2d) { c.moveTo(p.x * k, p.y * k); c.lineTo(nx * k, ny * k); }
       p.x = nx; p.y = ny;
     }
-    c.stroke();
+    if (draw2d) c.stroke();
+    if (view3d && S.view === '3d') view3d.pushParticles(particles, S.showParticles);
   }
 
   // ---------------------------------------------------------------- loop
   let lastFrame = 0, fpsAcc = 0, fpsN = 0, fpsT = performance.now();
   function frame(now) {
     requestAnimationFrame(frame);
-    if (!solver || !S.data) return;
-    if (document.hidden) return;
-    if (now - lastFrame < 1000 / FPS_CAP - 2) return;
+    if (document.hidden) return;                       // pause when the tab is hidden
+    if (now - lastFrame < 1000 / FPS_CAP - 2) return;  // frame cap
     lastFrame = now;
     if (S.running && now - S.lastTouch > IDLE_PAUSE_MS) { S.running = false; S.idlePaused = true; syncRun(); }
-    if (!S.running) return;
-    if (solver.lost) { console.warn('[wind] GPU context lost, switching to CPU'); params.set('engine', 'cpu'); restart(); return; }
-    const t0 = performance.now();
-    solver.step(S.spf);
-    S.steps += S.spf;
-    const buf = solver.read();
-    if (S.showField) paintField(buf);
-    moveParticles(buf, S.spf);
-    const work = performance.now() - t0;
-    // keep the page light: aim for well under one frame of work
-    if (work > 24 && S.spf > 2) S.spf = Math.max(2, Math.floor(S.spf * 0.8));
-    else if (work < 10 && S.spf < (solver.kind === 'gpu' ? 36 : 8)) S.spf += 1;
-    fpsN++;
-    if (now - fpsT > 1000) { S.fps = fpsN * 1000 / (now - fpsT); fpsN = 0; fpsT = now; updateStatus(); }
+    if (solver && S.data && !S.loading && S.running) {
+      if (solver.lost) { console.warn('[wind] GPU context lost, switching to CPU'); params.set('engine', 'cpu'); restart(); return; }
+      const t0 = performance.now();
+      solver.step(S.spf);
+      S.steps += S.spf;
+      const buf = solver.read();
+      if (S.showField) { paintField(buf); if (view3d) view3d.markField(); }
+      moveParticles(buf, S.spf);
+      const work = performance.now() - t0;
+      // keep the page light: aim for well under one frame of work
+      if (work > 24 && S.spf > 2) S.spf = Math.max(2, Math.floor(S.spf * 0.8));
+      else if (work < 10 && S.spf < (solver.kind === 'gpu' ? 36 : 8)) S.spf += 1;
+      fpsN++;
+    }
+    if (view3d && S.view === '3d') { sync3d(); view3d.frame(); updateNorth(); }
+    if (now - fpsT > 1000) { S.fps = fpsN * 1000 / (now - fpsT); fpsN = 0; fpsT = now; if (solver) updateStatus(); }
   }
   function updateStatus() {
     const flow = S.steps * U0 / solver.N;      // how many times the wind has crossed the square
@@ -501,23 +551,91 @@ void main(){
 
   // ---------------------------------------------------------------- area + wind
   const cache = {};
-  async function loadArea(id) {
-    if (cache[id]) return cache[id];
-    let d;
-    if (window.HKW_DATA && window.HKW_DATA[id]) d = window.HKW_DATA[id];
-    else {
-      const base = window.HKW_DATA_URL || 'data/';
-      const r = await fetch(base + id + '.json');
-      if (!r.ok) throw new Error('could not load ' + id);
-      d = await r.json();
-    }
+  function prepBuildings(d) {
     for (const b of d.buildings) {
       let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
       for (const r of b.rings) for (const [x, y] of r) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
       b.bb = [x0, y0, x1, y1];
     }
-    cache[id] = d; return d;
+    return d;
   }
+  async function getJSON(url, opt) {
+    const r = await fetch(url, opt);
+    if (!r.ok) throw new Error(`${r.status} from ${new URL(url, location.href).host}`);
+    return r.json();
+  }
+  async function loadArea(id) {
+    if (cache[id]) return cache[id];
+    const d = (window.HKW_DATA && window.HKW_DATA[id]) || await getJSON(DATA_URL + id + '.json');
+    return (cache[id] = prepBuildings(d));
+  }
+
+  // any site: LandsD buildings from the CSDI web feature service, by bounding box
+  async function fetchBuildings(lat, lon, onCount) {
+    const half = DOMAIN_M / 2 + FETCH_PAD_M, dlat = half / M_PER_DEG_LAT, dlon = half / mPerDegLon(lat);
+    const bbox = [lat - dlat, lon - dlon, lat + dlat, lon + dlon].map((v) => v.toFixed(6)).join(',');
+    let feats = [];
+    for (let start = 0; start < 20000; start += 1000) {
+      const url = `${WFS}?service=wfs&version=2.0.0&request=GetFeature&typeNames=csdi:Building&outputFormat=GEOJSON` +
+        `&count=1000&startIndex=${start}&bbox=${bbox},urn:ogc:def:crs:EPSG::4326`;
+      const d = await getJSON(url);
+      const batch = d.features || [];
+      feats = feats.concat(batch); onCount(feats.length);
+      if (batch.length < 1000) break;
+    }
+    return feats;
+  }
+  // same rules as prep_data.py: active blocks with both levels, outer rings, local metres (x east, y south)
+  function convertFeatures(feats, lat, lon) {
+    const kx = mPerDegLon(lat), half = DOMAIN_M / 2, out = [];
+    const seen = new Set();
+    for (const f of feats) {
+      const p = f.properties || {}, g = f.geometry || {};
+      if (p.Status != null && p.Status !== 'Active') continue;
+      if (p.BaseHeight == null || p.TopHeight == null) continue;
+      if (seen.has(p.OBJECTID)) continue; seen.add(p.OBJECTID);
+      const polys = g.type === 'Polygon' ? [g.coordinates] : (g.coordinates || []);
+      const rings = [];
+      for (const poly of polys) if (poly && poly[0]) rings.push(poly[0].map(([x, y]) => [+((x - lon) * kx + half).toFixed(2), +(-(y - lat) * M_PER_DEG_LAT + half).toFixed(2)]));
+      if (!rings.length) continue;
+      out.push({ id: p.OBJECTID, name: (p.BuildingNameEN || '').trim(), name_zh: (p.BuildingNameTC || '').trim(), type: p.BuildingBlockType || '',
+        base: +(+p.BaseHeight).toFixed(1), top: +(+p.TopHeight).toFixed(1), h: +(p.TopHeight - p.BaseHeight).toFixed(1), storeys: p.Storeys, rings });
+    }
+    return out;
+  }
+  // PlanD Site Wind Availability Data: the 500 m cell under the centre, 200 m level, three seasons
+  let gridP = null;
+  async function fetchSiteWind(lat, lon) {
+    gridP = gridP || getJSON(DATA_URL + 'pland_grid.json');
+    const G = await gridP;
+    const [E, N] = HK80.toGrid(lat, lon);
+    const c = Math.floor((E - G.x0) / G.step), r = Math.floor((N - G.y0) / G.step);
+    const id = c >= 0 && r >= 0 && c < G.cols && r < G.rows ? G.ids[r * G.cols + c] : '';
+    const res = { height_m: 200, seasons: {} };
+    if (!id) return res;
+    res.grid_id = id; res.cell_hk1980 = [G.x0 + c * G.step, G.y0 + r * G.step, G.x0 + (c + 1) * G.step, G.y0 + (r + 1) * G.step];
+    await Promise.all(['annual', 'summer', 'winter'].map(async (season) => {
+      const url = G.url.replace('{season}', season).replace('{id}', id);
+      try {
+        const r2 = await fetch(url); if (!r2.ok) return;
+        const lines = (await r2.text()).split(/\r?\n/);
+        const dirs = lines[0].split('\t').slice(2, 18).map((v) => v.trim());
+        const freq = lines[1].split('\t').slice(2, 18).map(Number);
+        if (dirs.length === 16 && freq.every(isFinite)) res.seasons[season] = { dirs, freq, source: url };
+      } catch (e) { console.info('[wind] PlanD table not loaded', season, e.message); }
+    }));
+    return res;
+  }
+  async function loadSite(lat, lon, label, onCount) {
+    const key = lat.toFixed(5) + ',' + lon.toFixed(5);
+    if (cache[key]) return cache[key];
+    const [feats, wind] = await Promise.all([fetchBuildings(lat, lon, onCount), fetchSiteWind(lat, lon)]);
+    const d = prepBuildings({ id: key, name_en: label || 'Picked on the map', name_zh: label ? '' : '地圖揀點', live: true,
+      centre_wgs84: [lat, lon], size_m: DOMAIN_M, buildings: convertFeatures(feats, lat, lon), site_wind: wind,
+      fetched: new Date().toISOString().slice(0, 10) });
+    return (cache[key] = d);
+  }
+
   function seasonFreq() {
     const s = S.data && S.data.site_wind && S.data.site_wind.seasons[S.season];
     if (!s) return null;
@@ -525,31 +643,294 @@ void main(){
     return DIRS.map(([d]) => m[d] || 0);
   }
   function topDir(season) {
-    const s = S.data.site_wind.seasons[season]; if (!s) return 4;
+    const s = S.data && S.data.site_wind && S.data.site_wind.seasons[season]; if (!s) return 4;
     let bi = 0; s.freq.forEach((f, i) => { if (f > s.freq[bi]) bi = i; });
     return Math.max(0, DIRS.findIndex(([d]) => d === s.dirs[bi]));
   }
+
+  const loadingEl = $('#hkwLoading');
+  let loadToken = 0;
+  function showLoading(html) { loadingEl.innerHTML = html; loadingEl.hidden = !html; }
+  function setURL(q) {
+    try {
+      const u = new URL(location.href);
+      ['area', 'lat', 'lon', 'q'].forEach((k) => u.searchParams.delete(k));
+      for (const [k, v] of Object.entries(q)) if (v != null && v !== '') u.searchParams.set(k, v);
+      history.replaceState(null, '', u);
+    } catch (e) { /* file:// or sandboxed */ }
+  }
   async function selectArea(id) {
-    S.areaId = id;
+    const tok = ++loadToken;
+    S.areaId = id; S.loading = true;
     root.querySelectorAll('[data-area]').forEach((b) => b.classList.toggle('on', b.dataset.area === id));
-    $('#hkwAreaNote').textContent = 'Loading 載入中…';
+    showLoading('Loading 載入中…');
     let d;
-    try { d = await loadArea(id); } catch (e) { $('#hkwAreaNote').textContent = 'Could not load this area: ' + e.message; return; }
-    S.data = d; buildings = d.buildings; S.user = []; S.removed = new Set(); S.sel = null; syncSel();
-    const nb = buildings.filter(blocks).length;
-    $('#hkwAreaNote').innerHTML = `<b>${d.name_en} ${d.name_zh}</b> · ${d.size_m} m x ${d.size_m} m · ${nb} building blocks stand in the 2 m slice (of ${buildings.length} in LandsD data).<br>${d.note_en}<br>${d.note_zh}`;
-    if (S.dirIdx === null) {
-      const want = params.get('dir');
-      const wi = want ? DIRS.findIndex(([e]) => e === want.toUpperCase()) : -1;
-      S.dirIdx = wi >= 0 ? wi : topDir('annual');
+    try { d = await loadArea(id); } catch (e) { if (tok === loadToken) { S.loading = false; showLoading(''); $('#hkwAreaNote').textContent = 'Could not load this area: ' + e.message; } return; }
+    if (tok !== loadToken) return;
+    setURL({ area: id });
+    if (d.centre_wgs84) showSquare(d.centre_wgs84[0], d.centre_wgs84[1], false);
+    useData(d);
+  }
+  async function selectSite(lat, lon, label) {
+    if (!(lat > HK_BOUNDS[0] && lat < HK_BOUNDS[2] && lon > HK_BOUNDS[1] && lon < HK_BOUNDS[3])) {
+      $('#hkwAreaNote').textContent = 'That point is outside Hong Kong. Pick a place inside Hong Kong. 請揀香港境內嘅地點。';
+      return;
     }
+    const tok = ++loadToken;
+    S.areaId = null; S.loading = true; touch();
+    root.querySelectorAll('[data-area]').forEach((b) => b.classList.remove('on'));
+    showSquare(lat, lon, true);
+    showLoading('Fetching buildings from Lands Department… 攞緊屋宇資料…');
+    let d;
+    try {
+      d = await loadSite(lat, lon, label, (n) => { if (tok === loadToken) showLoading(`Fetching buildings from Lands Department… ${n} so far 攞緊屋宇資料…`); });
+    } catch (e) {
+      if (tok !== loadToken) return;
+      console.info('[wind] site load failed:', e.message);
+      showLoading(`<div>The Lands Department data service did not answer (${escapeHTML(e.message)}). 政府數據服務冇回應。<br><button type="button" class="hkw-btn" id="hkwRetry">Try again 再試</button></div>`);
+      $('#hkwRetry').addEventListener('click', () => selectSite(lat, lon, label));
+      return;
+    }
+    if (tok !== loadToken) return;
+    setURL({ lat: lat.toFixed(5), lon: lon.toFixed(5), q: label || '' });
+    useData(d);
+  }
+  function escapeHTML(t) { return String(t).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+  function useData(d) {
+    S.loading = false; showLoading('');
+    S.data = d; buildings = d.buildings; S.user = []; S.removed = new Set(); S.sel = null; syncSel();
+    need3d.site = true; need3d.user = true;
+    const nb = buildings.filter(blocks).length;
+    const sw = d.site_wind || {};
+    const windNote = sw.grid_id ? `Wind table: PlanD grid cell ${escapeHTML(sw.grid_id)}.` : 'No PlanD wind table for this point (sea or outside the grid): all 16 directions are shown as equally likely. 呢點冇 PlanD 風資料。';
+    if (d.live) {
+      const [la, lo] = d.centre_wgs84;
+      $('#hkwAreaNote').innerHTML = `<b>${escapeHTML(d.name_en)}${d.name_zh ? ' ' + escapeHTML(d.name_zh) : ''}</b> · ${la.toFixed(5)} N, ${lo.toFixed(5)} E · ${d.size_m} m x ${d.size_m} m · ` +
+        `${nb} building blocks stand in the 2 m slice (of ${buildings.length} in LandsD data, fetched live ${d.fetched}). ${windNote}` +
+        (buildings.length === 0 ? '<br>No buildings here: open ground or sea. 呢度冇建築物。' : '');
+    } else {
+      $('#hkwAreaNote').innerHTML = `<b>${d.name_en} ${d.name_zh}</b> · ${d.size_m} m x ${d.size_m} m · ${nb} building blocks stand in the 2 m slice (of ${buildings.length} in LandsD data).<br>${d.note_en}<br>${d.note_zh}`;
+    }
+    const want = params.get('dir');
+    const wi = want && S.dirIdx === null ? DIRS.findIndex(([e]) => e === want.toUpperCase()) : -1;
+    S.dirIdx = wi >= 0 ? wi : topDir('annual');       // each site starts from its own most common wind
     drawRose(); restartFlow();
   }
+
+  // ---------------------------------------------------------------- base map (Leaflet + LandsD tiles)
+  let map = null, square = null;
+  function initMap() {
+    const el = $('#hkwMap');
+    if (!window.L) { el.innerHTML = '<p class="small" style="padding:12px">The map could not load (offline?). Search still works. 地圖載入唔到，搜尋仍然用得。</p>'; return; }
+    map = L.map(el, { minZoom: 10, maxZoom: 19, maxBounds: [[21.9, 113.6], [22.8, 114.7]], scrollWheelZoom: false }).setView([22.33, 114.17], 11);
+    L.tileLayer('https://mapapi.geodata.gov.hk/gs/api/v1.0.0/xyz/basemap/wgs84/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '<a href="https://api.portal.hkmapservice.gov.hk/disclaimer" target="_blank" rel="noopener">&copy; Map from Lands Department</a>',
+    }).addTo(map);
+    L.tileLayer('https://mapapi.geodata.gov.hk/gs/api/v1.0.0/xyz/label/hk/en/wgs84/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+    const Logo = L.Control.extend({ options: { position: 'bottomleft' }, onAdd() {
+      const d = L.DomUtil.create('div', 'hkw-landsd');
+      d.innerHTML = '<img src="https://api.hkmapservice.gov.hk/mapapi/landsdlogo.jpg" alt="Lands Department">';
+      return d;
+    } });
+    new Logo().addTo(map);
+    map.on('focus', () => map.scrollWheelZoom.enable());
+    map.on('click', (e) => { qEl.value = ''; selectSite(e.latlng.lat, e.latlng.lng, null); });
+  }
+  function showSquare(lat, lon, fly) {
+    if (!map) return;
+    const half = DOMAIN_M / 2, dlat = half / M_PER_DEG_LAT, dlon = half / mPerDegLon(lat);
+    const b = [[lat - dlat, lon - dlon], [lat + dlat, lon + dlon]];
+    if (square) square.setBounds(b);
+    else square = L.rectangle(b, { color: '#c46240', weight: 2, fillOpacity: 0.08, interactive: false }).addTo(map);
+    if (fly) map.flyToBounds(b, { padding: [30, 30], maxZoom: 16, duration: 0.8 });
+    else map.fitBounds(b, { padding: [30, 30], maxZoom: 15 });
+  }
+
+  // ---------------------------------------------------------------- search (LandsD place names + ALS addresses)
+  const qEl = $('#hkwQ'), suggEl = $('#hkwSugg');
+  let sTimer = 0, sAbort = null, sItems = [], sIdx = -1;
+  const titleCase = (t) => (t || '').toLowerCase().replace(/\b([a-z])/g, (m) => m.toUpperCase());
+  async function placeSearch(v, signal) {
+    const arr = await getJSON(PLACE_SEARCH + encodeURIComponent(v), { signal });
+    // district and estate names (no street address) before shops and kiosks
+    const rows = (arr || []).map((r, i) => [r.addressEN ? 1 : 0, i, r]).sort((x, y) => x[0] - y[0] || x[1] - y[1]).map((x) => x[2]);
+    return rows.slice(0, 7).map((r) => {
+      const [lat, lon] = HK80.toWGS(+r.x, +r.y);
+      return { kind: 'Place 地方', title: `${titleCase(r.nameEN)} ${r.nameZH || ''}`.trim(), sub: [titleCase(r.addressEN), r.districtEN].filter(Boolean).join(' · '), lat, lon };
+    });
+  }
+  async function addrSearch(v, signal) {
+    const d = await getJSON(ALS + encodeURIComponent(v), { signal, headers: { Accept: 'application/json' } });
+    return (d.SuggestedAddress || []).slice(0, 4).map((s) => {
+      const pa = s.Address.PremisesAddress, e = pa.EngPremisesAddress || {}, c = pa.ChiPremisesAddress || {}, g = pa.GeospatialInformation || {};
+      const st = e.EngStreet ? [e.EngStreet.BuildingNoFrom, titleCase(e.EngStreet.StreetName)].filter(Boolean).join(' ') : '';
+      const en = [titleCase(e.BuildingName), st, e.EngEstate && titleCase(e.EngEstate.EstateName)].filter(Boolean).join(', ');
+      const zh = [c.ChiStreet && (c.ChiStreet.StreetName || '') + (c.ChiStreet.BuildingNoFrom ? c.ChiStreet.BuildingNoFrom + '號' : ''), c.BuildingName].filter(Boolean).join(' ');
+      const dist = e.EngDistrict && e.EngDistrict.DcDistrict;
+      return { kind: 'Address 地址', title: en || zh, sub: [zh, titleCase(dist)].filter(Boolean).join(' · '), lat: +g.Latitude, lon: +g.Longitude };
+    }).filter((x) => isFinite(x.lat) && isFinite(x.lon));
+  }
+  function renderSugg(items, msg) {
+    sItems = items; sIdx = -1;
+    suggEl.innerHTML = '';
+    if (msg) { const li = document.createElement('li'); li.className = 'msg'; li.textContent = msg; suggEl.appendChild(li); }
+    items.forEach((it, i) => {
+      const li = document.createElement('li'); li.setAttribute('role', 'option'); li.id = 'hkwS' + i;
+      const k = document.createElement('span'); k.className = 'k'; k.textContent = it.kind;
+      const s = document.createElement('span'); s.className = 's'; s.textContent = it.sub;
+      li.append(k, document.createTextNode(it.title), s);
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); pickSugg(i); });
+      suggEl.appendChild(li);
+    });
+    suggEl.hidden = !msg && !items.length;
+    qEl.setAttribute('aria-expanded', String(!suggEl.hidden));
+  }
+  function hideSugg() { suggEl.hidden = true; qEl.setAttribute('aria-expanded', 'false'); }
+  function pickSugg(i) {
+    const it = sItems[i]; if (!it) return;
+    qEl.value = it.title; hideSugg(); qEl.blur();
+    selectSite(it.lat, it.lon, it.title);
+  }
+  async function runSearch(v) {
+    if (sAbort) sAbort.abort();
+    const ac = sAbort = new AbortController();
+    renderSugg([], 'Searching… 搜尋中…');
+    const [pl, ad] = await Promise.allSettled([placeSearch(v, ac.signal), addrSearch(v, ac.signal)]);
+    if (ac.signal.aborted) return;
+    const items = [];
+    for (const it of [...(pl.value || []), ...(ad.value || [])]) {
+      if (!items.some((o) => Math.abs(o.lat - it.lat) < 0.0004 && Math.abs(o.lon - it.lon) < 0.0004)) items.push(it);
+    }
+    if (items.length) renderSugg(items.slice(0, 9));
+    else renderSugg([], pl.status === 'rejected' && ad.status === 'rejected' ? 'The search services did not answer. Try again, or click the map. 搜尋服務冇回應。' : 'No match. Try another name, or click the map. 搵唔到，試吓第二個名或者撳地圖。');
+  }
+  qEl.addEventListener('input', () => {
+    clearTimeout(sTimer);
+    const v = qEl.value.trim();
+    if (v.length < 2) { hideSugg(); return; }
+    sTimer = setTimeout(() => runSearch(v), 380);     // be gentle with the government APIs
+  });
+  qEl.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (!sItems.length) return; e.preventDefault();
+      sIdx = (sIdx + (e.key === 'ArrowDown' ? 1 : -1) + sItems.length) % sItems.length;
+      suggEl.querySelectorAll('[role=option]').forEach((li, i) => li.setAttribute('aria-selected', String(i === sIdx)));
+      qEl.setAttribute('aria-activedescendant', 'hkwS' + sIdx);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (sItems.length) pickSugg(Math.max(0, sIdx));
+      else if (qEl.value.trim().length >= 2) { clearTimeout(sTimer); runSearch(qEl.value.trim()); }
+    } else if (e.key === 'Escape') hideSugg();
+  });
+  qEl.addEventListener('blur', () => setTimeout(hideSugg, 150));
+
+  // ---------------------------------------------------------------- 3D view (three.js, loaded on first use)
+  const stateFor3d = () => ({ buildings, removed: S.removed, user: S.user, sel: S.sel, blocks });
+  let lastRemovedKey = '';
+  function sync3d() {
+    const key = [...S.removed].join(',');
+    if (need3d.site || key !== lastRemovedKey) { view3d.rebuild(stateFor3d(), need3d.site); need3d.site = false; lastRemovedKey = key; }
+    if (need3d.user) { view3d.rebuildUser(stateFor3d()); need3d.user = false; }
+  }
+  function ensure3d() {
+    if (!view3dLoading) {
+      view3dLoading = import(new URL(STATIC + 'wind3d.js' + (window.HKW_VER ? '?v=' + window.HKW_VER : ''), document.baseURI).href).then((m) => {
+        view3d = m.create({ container: $('#hkw3d'), fieldCanvas: cvField, domain: DOMAIN_M, onPick: pick3d });
+        view3d.setTheme(isDark());
+      });
+      view3dLoading.catch(() => { view3dLoading = null; });
+    }
+    return view3dLoading;
+  }
+  function updateNorth() {
+    const n = $('#hkwNorth');
+    n.style.transform = S.view === '3d' && view3d ? `rotate(${view3d.azimuth()}rad)` : '';
+  }
+  const VIEW_HELP = {
+    '2d': 'Plan view, north up. 平面，北向上。',
+    '3d': 'Drag to orbit, right-drag or two fingers to pan, scroll or pinch to zoom. 拖曳轉動，雙指移動或縮放。',
+  };
+  async function setView(v) {
+    touch();
+    if (v === '3d' && !view3d) {
+      $('#hkwViewHelp').textContent = 'Loading 3D… 載入 3D 中…';
+      try { await ensure3d(); } catch (e) {
+        console.warn('[wind] 3D could not start:', e.message);
+        $('#hkwViewHelp').textContent = '3D could not start here (' + e.message + '). The plan view still works. 3D 開唔到。';
+        return;
+      }
+    }
+    S.view = v;
+    root.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('on', b.dataset.view === v));
+    stage.classList.toggle('is3d', v === '3d');
+    $('#hkw3d').hidden = v !== '3d';
+    $('#hkwResetView').hidden = v !== '3d';
+    $('#hkwViewHelp').textContent = VIEW_HELP[v];
+    tip.hidden = true;
+    if (v === '3d') {
+      view3d.resize(S.size, S.size);
+      need3d.user = true;
+      if (S.dirIdx !== null) view3d.setWind(S.dirIdx);
+      particles.forEach((p) => { p.fresh = true; });
+      view3d.showField(S.showField);
+      if (solver && S.steps > 0 && S.showField) { paintField(solver.read()); view3d.markField(); }
+    } else {
+      ctxT.setTransform(1, 0, 0, 1, 0, 0); ctxT.clearRect(0, 0, cvTrail.width, cvTrail.height);
+      drawBuildings();
+    }
+    updateNorth();
+  }
+  function placeTip(ev, html) {
+    if (!html) { tip.hidden = true; return; }
+    tip.innerHTML = html; tip.hidden = false;
+    const r = stage.getBoundingClientRect();
+    let lx = ev.clientX - r.left + 14, ly = ev.clientY - r.top + 14;
+    if (lx > S.size - 220) lx = ev.clientX - r.left - 220;
+    if (ly > S.size - 60) ly = ev.clientY - r.top - 60;
+    tip.style.left = lx + 'px'; tip.style.top = ly + 'px';
+  }
+  function buildingTip(b) {
+    const nm = [b.name, b.name_zh].filter(Boolean).join(' ') || 'Unnamed block 未命名';
+    const st = S.removed.has(b.id) ? 'taken away in this sketch' : (blocks(b) ? 'blocks the 2 m slice' : (b.type === 'Open-sided Structure' ? 'open-sided, wind passes under' : 'under 2.5 m, ignored'));
+    return `<b>${escapeHTML(nm)}</b><br>${escapeHTML(b.type || 'Block')} · ${b.h} m tall${b.storeys ? `, ${b.storeys} storeys` : ''} · ${st}`;
+  }
+  function pick3d(hit) {
+    touch();
+    if (S.mode === 'add') {
+      if (hit.kind === 'user') { S.sel = hit.u; }
+      else if (hit.kind === 'ground') {
+        const h = +$('#hkwNewH').value || 60;
+        const u = { id: nextUserId++, cx: Math.round(hit.x), cy: Math.round(hit.y), w: 40, d: 30, rot: 0, h };
+        S.user.push(u); S.sel = u; rebuildMask();
+      } else { placeTip(hit.ev, 'Click open ground to place a 40 x 30 m block. 撳空地放一座 40 x 30 米嘅樓。'); return; }
+    } else if (S.mode === 'remove') {
+      if (hit.kind === 'user') { S.user = S.user.filter((v) => v !== hit.u); if (S.sel === hit.u) S.sel = null; }
+      else if (hit.kind === 'building') S.removed.add(hit.b.id);
+      else if (hit.kind === 'ground') {
+        const b = hitBuilding(hit.x, hit.y);       // a taken-away block has no solid: click its outline to bring it back
+        if (b && S.removed.has(b.id)) S.removed.delete(b.id);
+        else return;
+      }
+      rebuildMask();
+    } else {
+      if (hit.kind === 'user') { S.sel = hit.u; placeTip(hit.ev, `<b>Your block 你加嘅樓</b><br>${hit.u.w} m x ${hit.u.d} m, ${hit.u.h} m tall`); }
+      else if (hit.kind === 'building') placeTip(hit.ev, buildingTip(hit.b));
+      else { S.sel = null; tip.hidden = true; }
+    }
+    syncSel(); drawBuildings();
+  }
+  root.addEventListener('click', (ev) => {
+    const t = ev.target.closest('[data-view]');
+    if (t && root.contains(t)) setView(t.dataset.view);
+  });
+  $('#hkwResetView').addEventListener('click', () => { if (view3d) view3d.resetView(); });
+
   function restartFlow() {
     if (!solver) newSolver();
     rebuildMask();
     solver.init(inflow(S.dirIdx));
     S.steps = 0; resetParticles(); drawBuildings(); updateWindText();
+    if (view3d) view3d.setWind(S.dirIdx);
     if (!S.running && !S.idlePaused) { /* stay paused */ }
   }
   function restart() { S.field = null; newSolver(); restartFlow(); }
@@ -699,7 +1080,7 @@ void main(){
   runBtn.addEventListener('click', () => { S.running = !S.running; S.idlePaused = false; touch(); syncRun(); });
   $('#hkwReset').addEventListener('click', () => { touch(); restartFlow(); });
   $('#hkwUndo').addEventListener('click', () => { S.user = []; S.removed = new Set(); S.sel = null; syncSel(); drawBuildings(); rebuildMask(); });
-  $('#hkwShowField').addEventListener('change', (e) => { S.showField = e.target.checked; cvField.style.visibility = S.showField ? 'visible' : 'hidden'; });
+  $('#hkwShowField').addEventListener('change', (e) => { S.showField = e.target.checked; cvField.style.visibility = S.showField ? '' : 'hidden'; if (view3d) view3d.showField(S.showField); });
   $('#hkwShowParticles').addEventListener('change', (e) => { S.showParticles = e.target.checked; });
   $('#hkwQuality').value = S.quality;
   $('#hkwQuality').addEventListener('change', (e) => { S.quality = e.target.value; restart(); });
@@ -711,7 +1092,7 @@ void main(){
   selInput('#hkwSelR', 'rot', () => { $('#hkwSelRv').textContent = S.sel.rot + '°'; });
   $('#hkwSelDel').addEventListener('click', () => { S.user = S.user.filter((v) => v !== S.sel); S.sel = null; syncSel(); drawBuildings(); rebuildMask(); });
   window.addEventListener('resize', () => { resize(); resetParticles(); });
-  new MutationObserver(() => drawBuildings()).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  new MutationObserver(() => { drawBuildings(); if (view3d) view3d.setTheme(isDark()); }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
   // test hook: add a block programmatically (used by the automated check)
   window.HKW.addBlock = (cx, cy, w, d, h, rot) => {
@@ -719,9 +1100,15 @@ void main(){
     S.user.push(u); S.sel = u; syncSel(); drawBuildings(); rebuildMask(); return u.id;
   };
   window.HKW.clearBlocks = () => { S.user = []; S.sel = null; syncSel(); drawBuildings(); rebuildMask(); };
+  window.HKW.selectSite = selectSite; window.HKW.selectArea = selectArea; window.HKW.setView = setView;
 
   // ---------------------------------------------------------------- start
   setMode('look'); syncRun(); resize(); newSolver();
-  selectArea(S.areaId);
+  initMap();
+  $('#hkwViewHelp').textContent = VIEW_HELP['2d'];
+  const plat = parseFloat(params.get('lat')), plon = parseFloat(params.get('lon'));
+  if (isFinite(plat) && isFinite(plon)) { if (params.get('q')) qEl.value = params.get('q'); selectSite(plat, plon, params.get('q')); }
+  else selectArea(S.areaId);
+  if (params.get('view') === '3d') setView('3d');
   requestAnimationFrame(frame);
 })();

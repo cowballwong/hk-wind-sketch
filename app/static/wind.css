@@ -9,8 +9,9 @@
 .hkw-lede{max-width:780px;color:rgb(var(--mcb-muted));margin:0 0 4px}
 .hkw-warn{font-size:12px;color:rgb(var(--mcb-accent));margin-top:8px;max-width:820px}
 .hkw .small{font-size:12px;color:rgb(var(--mcb-muted))}
-.hkw-areas{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
-.hkw-areas .hkw-step{margin:0 6px 0 0}
+.hkw-areas{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.hkw-areas .hkw-chip{text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media (max-width:520px){.hkw-areas{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .hkw-areanote{font-size:12px;color:rgb(var(--mcb-muted));margin:8px 0 14px;min-height:3.2em;max-width:900px}
 .hkw-areanote b{color:rgb(var(--mcb-ink))}
 .hkw-chip{border:1px solid rgb(var(--mcb-line));background:rgb(var(--mcb-paper));color:rgb(var(--mcb-ink));border-radius:999px;padding:5px 13px;font-size:13px;cursor:pointer}
@@ -66,3 +67,41 @@
 .hkw-explain p,.hkw-explain li{font-size:13px;color:rgb(var(--mcb-ink));margin:0 0 6px}
 .hkw-explain ul{margin:0;padding-left:18px;list-style:disc}
 .hkw-credits{font-size:11px;color:rgb(var(--mcb-muted));border-top:1px solid rgb(var(--mcb-line));margin-top:18px;padding-top:10px;line-height:1.5}
+
+/* v2: site search + map */
+.hkw-site{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px;align-items:start}
+@media (max-width:860px){.hkw-site{grid-template-columns:1fr}}
+.hkw-step2{margin-top:14px}
+.hkw-search{position:relative}
+.hkw-search input{width:100%;font-size:16px;padding:10px 12px;border:1px solid rgb(var(--mcb-ink));border-radius:6px;background:rgb(var(--mcb-paper));color:rgb(var(--mcb-ink))}
+.hkw-search input:focus{outline:2px solid rgb(var(--mcb-accent));outline-offset:1px}
+.hkw-sugg{position:absolute;z-index:1000;left:0;right:0;top:calc(100% + 4px);margin:0;padding:4px 0;list-style:none;background:rgb(var(--mcb-paper));border:1px solid rgb(var(--mcb-line));border-radius:6px;box-shadow:0 6px 18px rgba(0,0,0,.16);max-height:320px;overflow:auto}
+.hkw-sugg li{padding:7px 12px;cursor:pointer;line-height:1.35}
+.hkw-sugg li .k{font:10px ui-monospace,Menlo,Consolas,monospace;letter-spacing:.1em;text-transform:uppercase;color:rgb(var(--mcb-accent));margin-right:6px}
+.hkw-sugg li .s{display:block;font-size:12px;color:rgb(var(--mcb-muted))}
+.hkw-sugg li[aria-selected=true],.hkw-sugg li:hover{background:rgb(var(--mcb-accent) / .1)}
+.hkw-sugg li.msg{cursor:default;color:rgb(var(--mcb-muted));font-size:12px}
+.hkw-searchhint{margin:6px 0 0}
+.hkw-mapwrap{min-width:0}
+.hkw-map{height:260px;border:1px solid rgb(var(--mcb-ink));background:#dfe3e6;z-index:0}
+@media (max-width:860px){.hkw-map{height:230px}}
+.hkw-map .leaflet-control-attribution{font-size:10px}
+.hkw-map .hkw-landsd{background:#fff;padding:2px;line-height:0;border-radius:2px;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+.hkw-map .hkw-landsd img{height:26px;width:auto;display:block}
+/* v2: view toggle + 3D */
+.hkw-viewbar{display:flex;align-items:center;gap:0;margin-bottom:8px;flex-wrap:wrap}
+.hkw-seg{border:1px solid rgb(var(--mcb-ink));background:transparent;color:rgb(var(--mcb-ink));padding:6px 16px;font-size:13px;cursor:pointer}
+.hkw-seg:first-child{border-radius:4px 0 0 4px}
+.hkw-seg+.hkw-seg{border-left:0;border-radius:0 4px 4px 0}
+.hkw-seg.on{background:rgb(var(--mcb-ink));color:rgb(var(--mcb-cream))}
+.hkw-viewbar .small{margin-left:12px}
+.hkw-3d{position:absolute;inset:0;z-index:1}
+.hkw-3d canvas{position:absolute;inset:0;display:block;touch-action:none}
+.hkw-stage.is3d canvas#hkwField,.hkw-stage.is3d canvas#hkwTrail,.hkw-stage.is3d canvas#hkwBld,.hkw-stage.is3d .hkw-scale{visibility:hidden}
+.hkw-stage.is3d .hkw-north{color:#2a2926;text-shadow:none;z-index:2}
+[data-theme="dark"] .hkw-stage.is3d .hkw-north{color:#eee}
+.hkw-north{z-index:2;transform-origin:50% 60%}
+.hkw-loading{position:absolute;inset:0;z-index:4;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px;background:rgba(20,28,44,.62);color:#fff;font-size:14px;line-height:1.5}
+.hkw-loading[hidden]{display:none}
+.hkw-loading .hkw-btn{color:#fff;border-color:#fff;margin-top:10px}
+.hkw-tip{z-index:5}
